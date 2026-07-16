@@ -32,3 +32,8 @@ All selected dates are evaluated in **GMT+6 (Asia/Dhaka)**.
 - **Amount Mismatch:** the PSP and orchestrator amounts differ beyond the selected tolerance.
 - **Currency Mismatch:** the PSP and orchestrator transaction currencies differ after trimming and upper-case normalization.
 - Timestamp differences remain visible in detailed evidence but are not counted as mismatches.
+
+
+## Bulk file detection
+
+The Streamlit interface accepts all reports in one multi-file upload. Report types are identified from required exported column names, not from filenames. Nuvei EU and AE share the same schema, so the dashboard compares each Nuvei file's `Transaction ID` population against BridgerPay `pspOrderId` values under `SafeCharge-CreditCard-MID-EU` and `SafeCharge-CreditCard-MID-AE`. The automatic assignment is shown in the dashboard and exported in the `Upload Mapping` worksheet.

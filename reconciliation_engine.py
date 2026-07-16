@@ -818,6 +818,318 @@ def reconcile_paysafe_payprocc(pp: pd.DataFrame, psp_df: pd.DataFrame, amount_to
     )
 
 
+
+# ---------------------------------------------------------------------------
+# Bulk upload auto-detection
+# ---------------------------------------------------------------------------
+
+FILE_SLOT_LABELS: dict[str, str] = {
+    "bridgerpay": "BridgerPay",
+    "payprocc": "PayProcc",
+    "nuvei_eu": "Nuvei EU",
+    "nuvei_ae": "Nuvei AE",
+    "trustpayment": "TrustPayment",
+    "payabl": "Payabl",
+    "paysafe": "Paysafe",
+    "unlimit": "Unlimit",
+    "axcess_paystra": "Axcess/Paystra",
+    "paypal": "PayPal",
+    "dlocal": "Dlocal",
+    "skrill": "Skrill",
+}
+
+# Signatures are intentionally based on exported column names rather than file
+# names. This lets users select all reports in one upload action even when a
+# PSP generates generic or timestamp-only filenames.
+_FILE_SIGNATURES: list[tuple[str, set[str]]] = [
+    (
+        "bridgerpay",
+        {"processing_date", "pspName", "transactionId", "pspOrderId", "merchantOrderId", "amount", "currency", "status", "midAlias"},
+    ),
+    (
+        "payprocc",
+        {"Payment Public ID", "Merchant Order ID", "MID", "Transaction Date", "Type", "Status", "Amount", "Currency", "Gateway ID", "Transaction ID"},
+    ),
+    (
+        "trustpayment",
+        {"Reference", "Settle Status", "Error Code", "Authorised Amount", "Timestamp (BST)", "Currency", "Order Reference", "Request"},
+    ),
+    (
+        "payabl",
+        {"Tx-Id", "Tx-Type", "Order No.", "Date", "Time", "Currency", "Amount", "Status"},
+    ),
+    (
+        "paysafe",
+        {"Transaction ID", "Merchant Transaction ID", "Transaction Date", "Transaction Time (GMT)", "Transaction Type", "Status", "Amount", "Currency"},
+    ),
+    (
+        "unlimit",
+        {"Payment ID", "Amount", "CUR", "Status", "Order type", "Payment date"},
+    ),
+    (
+        "axcess_paystra",
+        {"UniqueId", "PaymentType", "RequestTimestamp", "TransactionId", "ChannelName", "ReturnCode", "Credit", "Currency", "Result", "InvoiceId"},
+    ),
+    (
+        "paypal",
+        {"Date", "Time", "Type", "Status", "Currency", "Gross", "Transaction ID", "Balance Impact"},
+    ),
+    (
+        "dlocal",
+        {"Reference", "Invoice", "Validated date", "Balance currency", "Amount", "Status", "Transaction type"},
+    ),
+    (
+        "skrill",
+        {"ID", "Time (CET)", "Type", "Transaction Details", "[+]", "Status", "Reference", "Currency"},
+    ),
+    (
+        "nuvei",
+        {"Date", "Transaction ID", "Transaction Type", "Transaction Result", "Amount", "Currency", "Custom Data"},
+    ),
+]
+
+
+def _source_name(source: Any, index: int = 0) -> str:
+    name = getattr(source, "name", None)
+    return str(name) if name else f"uploaded_file_{index + 1}"
+
+
+def _header_rows_from_csv(source: Any) -> list[set[str]]:
+    data = _bytes(source)
+    last_error: Exception | None = None
+    for encoding in ("utf-8-sig", "utf-8", "latin1"):
+        try:
+            sample = data[:200_000].decode(encoding)
+            try:
+                sep = csv.Sniffer().sniff(sample[:20_000], delimiters=",;\t|").delimiter
+            except csv.Error:
+                sep = ","
+            frame = pd.read_csv(BytesIO(data), encoding=encoding, sep=sep, nrows=0)
+            if len(frame.columns) == 1 and sep != ";":
+                frame = pd.read_csv(BytesIO(data), encoding=encoding, sep=";", nrows=0)
+            return [{str(column).strip() for column in frame.columns}]
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+    raise ValueError(f"Could not inspect CSV header: {last_error}")
+
+
+def _header_rows_from_excel(source: Any) -> list[set[str]]:
+    data = BytesIO(_bytes(source))
+    excel = pd.ExcelFile(data)
+    header_rows: list[set[str]] = []
+    for sheet_name in excel.sheet_names:
+        raw = pd.read_excel(excel, sheet_name=sheet_name, header=None, nrows=45, dtype=object)
+        for _, row in raw.iterrows():
+            values = {
+                str(value).strip()
+                for value in row.tolist()
+                if pd.notna(value) and str(value).strip()
+            }
+            if len(values) >= 3:
+                header_rows.append(values)
+    return header_rows
+
+
+def detect_uploaded_file_type(source: Any) -> tuple[str | None, str]:
+    """Detect one supported report type from its exported columns."""
+    filename = _source_name(source).lower()
+    try:
+        if filename.endswith((".xlsx", ".xls")):
+            rows = _header_rows_from_excel(source)
+        else:
+            rows = _header_rows_from_csv(source)
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Header could not be read: {exc}"
+
+    matches: list[tuple[str, int]] = []
+    for role, signature in _FILE_SIGNATURES:
+        if any(signature.issubset(row) for row in rows):
+            matches.append((role, len(signature)))
+
+    if not matches:
+        return None, "No supported column signature was found"
+
+    # Prefer the most specific signature if a generic export happens to satisfy
+    # more than one partial pattern.
+    matches.sort(key=lambda item: item[1], reverse=True)
+    best_size = matches[0][1]
+    best_roles = [role for role, size in matches if size == best_size]
+    if len(best_roles) > 1:
+        return None, f"Ambiguous column signatures: {', '.join(best_roles)}"
+    return best_roles[0], "Detected from exported columns"
+
+
+def _approved_count_for_role(role: str, source: Any, target_date: date) -> int:
+    parsers: dict[str, Callable[[Any, date], pd.DataFrame]] = {
+        "bridgerpay": parse_bridgerpay,
+        "payprocc": parse_payprocc,
+        "trustpayment": parse_trustpayment,
+        "payabl": parse_payabl,
+        "paysafe": parse_paysafe,
+        "unlimit": parse_unlimit,
+        "axcess_paystra": parse_axcess_paystra,
+        "paypal": parse_paypal,
+        "dlocal": parse_dlocal,
+        "skrill": parse_skrill,
+        "nuvei": parse_nuvei,
+    }
+    parser = parsers[role]
+    return len(parser(source, target_date))
+
+
+def auto_assign_uploaded_files(
+    uploaded_files: Iterable[Any] | None,
+    target_date: date,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Assign a multi-file upload to dashboard slots automatically.
+
+    Nuvei EU and AE have the same file structure, so those two reports are
+    distinguished by matching their Transaction IDs against the SafeCharge EU
+    and AE pspOrderId populations in the uploaded BridgerPay file.
+    """
+    sources = list(uploaded_files or [])
+    assigned: dict[str, Any] = {}
+    mapping: list[dict[str, Any]] = []
+    candidates: dict[str, list[tuple[int, Any]]] = {}
+
+    for index, source in enumerate(sources):
+        role, detail = detect_uploaded_file_type(source)
+        row = {
+            "File Name": _source_name(source, index),
+            "Detected Type": "Unrecognized" if role is None else ("Nuvei / SafeCharge" if role == "nuvei" else FILE_SLOT_LABELS.get(role, role)),
+            "Assigned Slot": "",
+            "Status": "Unrecognized" if role is None else "Detected",
+            "Details": detail,
+        }
+        mapping.append(row)
+        if role is not None:
+            candidates.setdefault(role, []).append((index, source))
+
+    # Unique file types. If more than one file has the same signature, select
+    # the one containing the most approved rows for the requested date and
+    # clearly mark the other files as ignored duplicates.
+    for role, role_candidates in candidates.items():
+        if role == "nuvei":
+            continue
+        if len(role_candidates) == 1:
+            index, source = role_candidates[0]
+            assigned[role] = source
+            mapping[index]["Assigned Slot"] = FILE_SLOT_LABELS[role]
+            mapping[index]["Status"] = "Assigned"
+            continue
+
+        scored: list[tuple[int, int, Any, str]] = []
+        for index, source in role_candidates:
+            try:
+                count = _approved_count_for_role(role, source, target_date)
+                error = ""
+            except Exception as exc:  # noqa: BLE001
+                count = -1
+                error = str(exc)
+            scored.append((count, index, source, error))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        best_count, best_index, best_source, _ = scored[0]
+        assigned[role] = best_source
+        mapping[best_index]["Assigned Slot"] = FILE_SLOT_LABELS[role]
+        mapping[best_index]["Status"] = "Assigned"
+        mapping[best_index]["Details"] = f"Selected from {len(role_candidates)} files; {max(best_count, 0)} approved/date rows"
+        for count, index, _source, error in scored[1:]:
+            mapping[index]["Status"] = "Ignored duplicate"
+            mapping[index]["Details"] = error or f"Another {FILE_SLOT_LABELS[role]} file had more approved/date rows ({max(best_count, 0)} vs {max(count, 0)})"
+
+    # Resolve Nuvei EU/AE using BridgerPay SafeCharge aliases.
+    nuvei_candidates = candidates.get("nuvei", [])
+    if nuvei_candidates:
+        region_sets: dict[str, set[str]] = {"EU": set(), "AE": set()}
+        bp_source = assigned.get("bridgerpay")
+        if bp_source is not None:
+            try:
+                bp = parse_bridgerpay(bp_source, target_date)
+                for region in ("EU", "AE"):
+                    alias = f"SafeCharge-CreditCard-MID-{region}"
+                    region_sets[region] = set(
+                        string_series(
+                            bp.loc[
+                                string_series(bp["status"]).str.lower().eq("approved")
+                                & string_series(bp["midAlias"]).eq(alias),
+                                "pspOrderId",
+                            ]
+                        ).map(_norm_key)
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
+        score_rows: list[tuple[int, int, str, Any, int]] = []
+        parsed_nuvei: dict[int, pd.DataFrame] = {}
+        for index, source in nuvei_candidates:
+            try:
+                frame = parse_nuvei(source, target_date)
+                parsed_nuvei[index] = frame
+                ids = set(string_series(frame["Transaction ID"]).map(_norm_key))
+            except Exception as exc:  # noqa: BLE001
+                mapping[index]["Status"] = "Needs review"
+                mapping[index]["Details"] = f"Nuvei file could not be parsed: {exc}"
+                ids = set()
+            for region in ("EU", "AE"):
+                score_rows.append((len(ids & region_sets[region]), index, region, source, len(ids)))
+
+        # Greedy assignment is sufficient for the two unique regions and is
+        # deterministic because scores are sorted by overlap and row count.
+        score_rows.sort(key=lambda item: (item[0], item[4]), reverse=True)
+        used_indices: set[int] = set()
+        used_regions: set[str] = set()
+        for score, index, region, source, row_count in score_rows:
+            if index in used_indices or region in used_regions or score <= 0:
+                continue
+            slot = f"nuvei_{region.lower()}"
+            assigned[slot] = source
+            used_indices.add(index)
+            used_regions.add(region)
+            mapping[index]["Assigned Slot"] = FILE_SLOT_LABELS[slot]
+            mapping[index]["Status"] = "Assigned"
+            mapping[index]["Details"] = f"{score} Transaction IDs matched BridgerPay SafeCharge {region}; {row_count} approved/date rows"
+
+        # Filename hints are a fallback when no SafeCharge overlap is available.
+        for index, source in nuvei_candidates:
+            if index in used_indices:
+                continue
+            filename = _source_name(source, index).lower()
+            hinted_region = None
+            if "nuvei_eu" in filename or "safecharge_eu" in filename or "-eu" in filename or "_eu" in filename:
+                hinted_region = "EU"
+            elif "nuvei_ae" in filename or "safecharge_ae" in filename or "-ae" in filename or "_ae" in filename:
+                hinted_region = "AE"
+            if hinted_region and hinted_region not in used_regions:
+                slot = f"nuvei_{hinted_region.lower()}"
+                assigned[slot] = source
+                used_indices.add(index)
+                used_regions.add(hinted_region)
+                mapping[index]["Assigned Slot"] = FILE_SLOT_LABELS[slot]
+                mapping[index]["Status"] = "Assigned by filename"
+                mapping[index]["Details"] = "SafeCharge overlap was unavailable; filename hint was used"
+
+        # With exactly one unresolved candidate and one remaining region, assign
+        # it as a transparent fallback instead of forcing a separate upload box.
+        unresolved = [(index, source) for index, source in nuvei_candidates if index not in used_indices]
+        remaining_regions = [region for region in ("EU", "AE") if region not in used_regions]
+        if len(unresolved) == 1 and len(remaining_regions) == 1:
+            index, source = unresolved[0]
+            region = remaining_regions[0]
+            slot = f"nuvei_{region.lower()}"
+            assigned[slot] = source
+            used_indices.add(index)
+            mapping[index]["Assigned Slot"] = FILE_SLOT_LABELS[slot]
+            mapping[index]["Status"] = "Assigned by elimination"
+            mapping[index]["Details"] = "Only one Nuvei file and one SafeCharge region remained"
+
+        for index, _source in nuvei_candidates:
+            if index not in used_indices and mapping[index]["Status"] == "Detected":
+                mapping[index]["Status"] = "Needs review"
+                mapping[index]["Details"] = "Could not determine whether this is Nuvei EU or Nuvei AE; upload BridgerPay with the Nuvei files"
+
+    return assigned, mapping
+
+
 # ---------------------------------------------------------------------------
 # Orchestration and exports
 # ---------------------------------------------------------------------------
@@ -972,7 +1284,12 @@ def exceptions_dataframe(results: list[ReconciliationResult]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
 
 
-def build_excel_report(results: list[ReconciliationResult], file_audit: list[dict[str, Any]], target_date: date) -> bytes:
+def build_excel_report(
+    results: list[ReconciliationResult],
+    file_audit: list[dict[str, Any]],
+    target_date: date,
+    upload_mapping: list[dict[str, Any]] | None = None,
+) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="yyyy-mm-dd hh:mm:ss") as writer:
         workbook = writer.book
@@ -1006,6 +1323,17 @@ def build_excel_report(results: list[ReconciliationResult], file_audit: list[dic
         ws.freeze_panes(3, 0)
         ws.autofilter(2, 0, max(2, len(summary) + 2), max(0, len(summary.columns) - 1))
 
+        if upload_mapping:
+            mapping_df = pd.DataFrame(upload_mapping)
+            mapping_df.to_excel(writer, sheet_name="Upload Mapping", index=False)
+            mws = writer.sheets["Upload Mapping"]
+            for col_idx, col in enumerate(mapping_df.columns):
+                mws.write(0, col_idx, col, header_fmt)
+                mws.set_column(col_idx, col_idx, min(max(len(str(col)) + 3, 18), 55))
+            mws.freeze_panes(1, 0)
+            if not mapping_df.empty:
+                mws.autofilter(0, 0, len(mapping_df), len(mapping_df.columns) - 1)
+
         audit_df = pd.DataFrame(file_audit)
         audit_df.to_excel(writer, sheet_name="File Audit", index=False)
         aws = writer.sheets["File Audit"]
@@ -1026,7 +1354,7 @@ def build_excel_report(results: list[ReconciliationResult], file_audit: list[dic
             ews.freeze_panes(1, 0)
             ews.autofilter(0, 0, len(all_exceptions), len(all_exceptions.columns) - 1)
 
-        used_names: set[str] = {"Summary", "File Audit", "All Exceptions"}
+        used_names: set[str] = {"Summary", "Upload Mapping", "File Audit", "All Exceptions"}
         for idx, result in enumerate(results, start=1):
             base = _safe_sheet_name(f"{idx:02d} {result.psp}")
             sheet_name = base

@@ -24,7 +24,7 @@ A Streamlit dashboard for reconciling approved PSP transactions against BridgerP
 
 ## Core features
 
-- Guided upload slots for every source file
+- One multi-file uploader for all PSP and orchestrator reports
 - GMT+6 conversion and date filtering
 - PSP-specific approval rules
 - Order/reference, amount and currency validation
@@ -57,9 +57,9 @@ No secrets or database configuration are required.
 ## Daily workflow
 
 1. Select the reconciliation date in GMT+6.
-2. Upload the relevant orchestrator file(s).
-3. Upload all available PSP files.
-4. Click **Run reconciliation**.
+2. Click the single upload field and select all available PSP and orchestrator reports together.
+3. Click **Detect files and run reconciliation**.
+4. Review the automatic file-mapping table.
 5. Review routes marked `REVIEW REQUIRED` or `MATCHED WITH AMOUNT VARIANCES`.
 6. Download the consolidated Excel report as audit evidence.
 
@@ -77,6 +77,14 @@ No secrets or database configuration are required.
 ## Privacy
 
 The app does not intentionally persist uploaded files. Streamlit Community Cloud may keep session data temporarily while the session is active; follow your organization's data-handling policy before uploading sensitive production reports.
+
+## Version 2.3 bulk upload
+
+- Replaces the individual upload slots with one multi-file uploader.
+- Detects BridgerPay, PayProcc and PSP reports from their exported columns.
+- Separates Nuvei EU and AE automatically by matching SafeCharge transaction IDs to the BridgerPay EU/AE MID aliases.
+- Displays an upload-mapping table and includes it in the consolidated Excel report.
+- Duplicate report types are handled by selecting the file with the most approved rows for the chosen date and clearly marking the other file as ignored.
 
 ## Version 2.2 fix
 

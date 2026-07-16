@@ -7,13 +7,14 @@ import pandas as pd
 import streamlit as st
 
 from reconciliation_engine import (
+    auto_assign_uploaded_files,
     build_excel_report,
     exceptions_dataframe,
     run_all_reconciliations,
     summary_dataframe,
 )
 
-APP_SCHEMA_VERSION = "2.2"
+APP_SCHEMA_VERSION = "2.3"
 
 # Clear only generated results when the dashboard structure changes. Uploaded
 # files remain available in Streamlit's uploader widgets, while stale summary
@@ -24,6 +25,8 @@ if st.session_state.get("_app_schema_version") != APP_SCHEMA_VERSION:
         "file_audit",
         "recon_signature",
         "recon_date",
+        "upload_mapping",
+        "assigned_slots",
     ):
         st.session_state.pop(state_key, None)
     st.session_state["_app_schema_version"] = APP_SCHEMA_VERSION
@@ -59,10 +62,6 @@ st.markdown(
 )
 
 
-def uploader(label: str, key: str, help_text: str):
-    return st.file_uploader(label, type=["csv", "xlsx", "xls"], key=key, help=help_text)
-
-
 with st.sidebar:
     st.header("Run settings")
     selected_date = st.date_input("Reconciliation date (GMT+6)", value=date.today() - timedelta(days=1))
@@ -77,48 +76,29 @@ with st.sidebar:
     st.caption("All files are processed only in the current Streamlit session.")
 
     st.divider()
-    st.subheader("Orchestrator files")
-    bridgerpay = uploader("BridgerPay report", "bridgerpay", "Upload the BridgerPay transactions report downloaded for the GMT+6 day.")
-    payprocc = uploader("PayProcc report", "payprocc", "Upload the PayProcc transactions report for the GMT+6 day.")
+    st.subheader("Upload all reports")
+    bulk_files = st.file_uploader(
+        "Select all PSP and orchestrator files together",
+        type=["csv", "xlsx", "xls"],
+        accept_multiple_files=True,
+        key="bulk_files",
+        help=(
+            "Select every available BridgerPay, PayProcc and PSP report in one action. "
+            "The dashboard identifies each file from its columns and separates Nuvei EU/AE using SafeCharge IDs."
+        ),
+    )
+    st.caption("You may upload only the files available for the day; incomplete routes are skipped automatically.")
 
-    st.divider()
-    st.subheader("Shared PSP file")
-    paysafe = uploader("Paysafe report", "paysafe", "One Paysafe file is used for both BridgerPay (BP_ IDs) and PayProcc (non-BP_ IDs).")
+    if bulk_files:
+        with st.expander(f"Selected files ({len(bulk_files)})", expanded=False):
+            for uploaded in bulk_files:
+                st.write(f"• {uploaded.name}")
 
-    st.divider()
-    with st.expander("BridgerPay PSP files", expanded=True):
-        nuvei_eu = uploader("Nuvei EU", "nuvei_eu", "SafeCharge EU report.")
-        nuvei_ae = uploader("Nuvei AE", "nuvei_ae", "SafeCharge AE report.")
-        trustpayment = uploader("TrustPayment", "trustpayment", "Approved rule: Settle Status 0/100, AUTH, Error Code 0.")
-        payabl = uploader("Payabl", "payabl", "Payabl is UTC+2 and is converted to GMT+6.")
-        unlimit = uploader("Unlimit", "unlimit", "Unlimit is named CardPay in BridgerPay.")
-        axcess_paystra = uploader("Axcess & Paystra", "axcess_paystra", "One report is split by fundednext.com - 3DS and fundednext.com - PS.")
-        paypal = uploader("PayPal", "paypal", "PayPal UTC-7 report; Gross amount is used.")
+    run_clicked = st.button("Detect files and run reconciliation", type="primary", use_container_width=True)
 
-    with st.expander("PayProcc PSP files", expanded=True):
-        dlocal = uploader("Dlocal", "dlocal", "Dlocal Validated date is used and converted from GMT+0 to GMT+6.")
-        skrill = uploader("Skrill", "skrill", "July CET-labelled report is treated as CEST/UTC+2.")
-
-    run_clicked = st.button("Run reconciliation", type="primary", use_container_width=True)
-
-files = {
-    "bridgerpay": bridgerpay,
-    "payprocc": payprocc,
-    "paysafe": paysafe,
-    "nuvei_eu": nuvei_eu,
-    "nuvei_ae": nuvei_ae,
-    "trustpayment": trustpayment,
-    "payabl": payabl,
-    "unlimit": unlimit,
-    "axcess_paystra": axcess_paystra,
-    "paypal": paypal,
-    "dlocal": dlocal,
-    "skrill": skrill,
-}
-
-uploaded_count = sum(value is not None for value in files.values())
+uploaded_count = len(bulk_files or [])
 ready_cols = st.columns(4)
-ready_cols[0].metric("Files uploaded", uploaded_count, "of 12 slots")
+ready_cols[0].metric("Files uploaded", uploaded_count)
 ready_cols[1].metric("Target date", selected_date.strftime("%d %b %Y"))
 ready_cols[2].metric("Timezone", "GMT+6")
 ready_cols[3].metric("Amount tolerance", f"{amount_tolerance:.2f}")
@@ -128,12 +108,9 @@ def signature() -> str:
     digest = hashlib.sha256()
     digest.update(str(selected_date).encode())
     digest.update(str(amount_tolerance).encode())
-    for key in sorted(files):
-        obj = files[key]
-        digest.update(key.encode())
-        if obj is not None:
-            digest.update(obj.name.encode())
-            digest.update(obj.getvalue())
+    for uploaded in sorted(bulk_files or [], key=lambda item: (item.name, len(item.getvalue()))):
+        digest.update(uploaded.name.encode())
+        digest.update(uploaded.getvalue())
     return digest.hexdigest()
 
 current_signature = signature()
@@ -142,24 +119,39 @@ if run_clicked:
     if uploaded_count == 0:
         st.warning("Upload at least one orchestrator file and its related PSP file.")
     else:
-        with st.spinner("Processing files and reconciling approved transactions…"):
-            results, file_audit = run_all_reconciliations(files, selected_date, amount_tolerance)
+        with st.spinner("Detecting reports, applying GMT+6 rules and reconciling approved transactions…"):
+            assigned_files, upload_mapping = auto_assign_uploaded_files(bulk_files, selected_date)
+            results, file_audit = run_all_reconciliations(assigned_files, selected_date, amount_tolerance)
             st.session_state["recon_results"] = results
             st.session_state["file_audit"] = file_audit
+            st.session_state["upload_mapping"] = upload_mapping
+            st.session_state["assigned_slots"] = sorted(assigned_files)
             st.session_state["recon_signature"] = current_signature
             st.session_state["recon_date"] = selected_date
 
 results = st.session_state.get("recon_results", [])
 file_audit = st.session_state.get("file_audit", [])
+upload_mapping = st.session_state.get("upload_mapping", [])
+assigned_slots = st.session_state.get("assigned_slots", [])
 results_are_current = st.session_state.get("recon_signature") == current_signature
 
 if results and not results_are_current:
-    st.info("The uploaded files or settings changed. Click **Run reconciliation** to refresh the results.")
+    st.info("The uploaded files or settings changed. Click **Detect files and run reconciliation** to refresh the results.")
+
+if upload_mapping:
+    with st.expander("Auto-detected file mapping", expanded=not results):
+        mapping_df = pd.DataFrame(upload_mapping)
+        st.dataframe(mapping_df, use_container_width=True, hide_index=True)
+        needs_review = mapping_df[~mapping_df["Status"].isin(["Assigned", "Assigned by filename", "Assigned by elimination"])]
+        if not needs_review.empty:
+            st.warning("Some uploaded files were not assigned or were treated as duplicates. Review the mapping table above.")
+        else:
+            st.success(f"All {len(mapping_df)} uploaded files were assigned automatically.")
 
 if not results:
     st.info(
-        "Upload the relevant orchestrator and PSP files from the sidebar, choose the GMT+6 date, and run the reconciliation. "
-        "Only routes with both required files will be processed."
+        "Upload all available orchestrator and PSP files together, choose the GMT+6 date, and run the reconciliation. "
+        "The dashboard detects file types automatically, and only routes with both required files are processed."
     )
 
     st.subheader("Built-in reconciliation logic")
@@ -222,7 +214,7 @@ st.caption(
 )
 
 # Downloads.
-report_bytes = build_excel_report(results, file_audit, st.session_state.get("recon_date", selected_date))
+report_bytes = build_excel_report(results, file_audit, st.session_state.get("recon_date", selected_date), upload_mapping)
 download_cols = st.columns([1, 1, 2])
 download_cols[0].download_button(
     "Download consolidated Excel",
@@ -358,6 +350,12 @@ with exceptions_tab:
         st.dataframe(filtered, use_container_width=True, hide_index=True, height=520)
 
 with audit_tab:
+    st.subheader("Auto-detected upload mapping")
+    if upload_mapping:
+        st.dataframe(pd.DataFrame(upload_mapping), use_container_width=True, hide_index=True)
+    else:
+        st.info("Run the reconciliation to see automatic file assignments.")
+
     st.subheader("File readiness and parsing audit")
     audit_df = pd.DataFrame(file_audit)
     st.dataframe(audit_df, use_container_width=True, hide_index=True)
