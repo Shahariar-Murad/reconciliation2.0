@@ -6,7 +6,6 @@ import hashlib
 import pandas as pd
 import streamlit as st
 
-# Set the page before any visible Streamlit output, including deployment errors.
 st.set_page_config(
     page_title="Payment Reconciliation Dashboard",
     page_icon="🔄",
@@ -14,28 +13,31 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Version-specific engine filename prevents Streamlit Cloud from loading an old
-# reconciliation_engine.py left in the repository from a previous release.
 try:
-    from reconciliation_engine_v24 import (
+    from reconciliation_engine_v25 import (
         ENGINE_VERSION,
+        auto_assign_backend_uploaded_files,
         auto_assign_uploaded_files,
+        backend_exceptions_dataframe,
+        backend_summary_dataframe,
+        build_backend_excel_report,
         build_excel_report,
         exceptions_dataframe,
         run_all_reconciliations,
+        run_backend_reconciliations,
         summary_dataframe,
     )
 except (ImportError, ModuleNotFoundError) as exc:
     st.error(
         "The deployment files are incomplete or from different dashboard versions. "
-        "Upload both app.py and reconciliation_engine_v24.py from the same v2.4 package, "
+        "Upload both app.py and reconciliation_engine_v25.py from the same v2.5 package, "
         "then reboot the Streamlit app."
     )
     st.code(f"Import details: {type(exc).__name__}: {exc}")
     st.stop()
 
-APP_SCHEMA_VERSION = "2.4"
-EXPECTED_ENGINE_VERSION = "2.4"
+APP_SCHEMA_VERSION = "2.5"
+EXPECTED_ENGINE_VERSION = "2.5"
 if ENGINE_VERSION != EXPECTED_ENGINE_VERSION:
     st.error(
         f"Dashboard/engine version mismatch: app {APP_SCHEMA_VERSION}, engine {ENGINE_VERSION}. "
@@ -43,27 +45,22 @@ if ENGINE_VERSION != EXPECTED_ENGINE_VERSION:
     )
     st.stop()
 
-# Clear only generated results when the dashboard structure changes. Uploaded
-# files remain available in Streamlit's uploader widgets, while stale summary
-# dictionaries cannot trigger KeyError after a deployment update.
 if st.session_state.get("_app_schema_version") != APP_SCHEMA_VERSION:
-    for state_key in (
-        "recon_results",
-        "file_audit",
-        "recon_signature",
-        "recon_date",
-        "upload_mapping",
-        "assigned_slots",
-    ):
-        st.session_state.pop(state_key, None)
+    for key in list(st.session_state.keys()):
+        if key.startswith("psp_") or key.startswith("backend_") or key in {
+            "recon_results", "file_audit", "recon_signature", "recon_date",
+            "upload_mapping", "assigned_slots",
+        }:
+            st.session_state.pop(key, None)
     st.session_state["_app_schema_version"] = APP_SCHEMA_VERSION
 
 st.markdown(
     """
 <style>
-    .block-container {padding-top: 1.5rem; padding-bottom: 3rem; max-width: 1600px;}
-    .main-title {font-size: 2.05rem; font-weight: 750; color: #17365D; margin-bottom: .1rem;}
-    .subtitle {color: #64748B; margin-bottom: 1.25rem;}
+    .block-container {padding-top: 1.35rem; padding-bottom: 3rem; max-width: 1650px;}
+    .main-title {font-size: 2.05rem; font-weight: 760; color: #17365D; margin-bottom: .1rem;}
+    .subtitle {color: #64748B; margin-bottom: 1.1rem;}
+    .flow-title {font-size: 1.45rem; font-weight: 730; color: #17365D; margin-top: .15rem;}
     .status-full {background:#E2F0D9; color:#375623; padding:.25rem .6rem; border-radius:999px; font-weight:700;}
     .status-review {background:#FCE4D6; color:#C00000; padding:.25rem .6rem; border-radius:999px; font-weight:700;}
     .status-variance {background:#FFF2CC; color:#7F6000; padding:.25rem .6rem; border-radius:999px; font-weight:700;}
@@ -77,14 +74,16 @@ st.markdown(
 
 st.markdown('<div class="main-title">Payment Reconciliation Dashboard</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitle">PSP → Orchestrator reconciliation standardized to GMT+6, with exception review and downloadable evidence.</div>',
+    '<div class="subtitle">Two-stage payment flow: PSP → Orchestrator → Backend API. Each stage is separated into its own workspace.</div>',
     unsafe_allow_html=True,
 )
 
-
 with st.sidebar:
-    st.header("Run settings")
-    selected_date = st.date_input("Reconciliation date (GMT+6)", value=date.today() - timedelta(days=1))
+    st.header("Global settings")
+    selected_date = st.date_input(
+        "Reconciliation date (GMT+6)",
+        value=date.today() - timedelta(days=1),
+    )
     amount_tolerance = st.number_input(
         "Amount tolerance",
         min_value=0.0,
@@ -93,317 +92,485 @@ with st.sidebar:
         step=0.01,
         help="Amounts within this absolute difference are treated as matching.",
     )
-    st.caption("All files are processed only in the current Streamlit session.")
-
     st.divider()
-    st.subheader("Upload all reports")
-    bulk_files = st.file_uploader(
-        "Select all PSP and orchestrator files together",
-        type=["csv", "xlsx", "xls"],
-        accept_multiple_files=True,
-        key="bulk_files",
-        help=(
-            "Select every available BridgerPay, PayProcc and PSP report in one action. "
-            "The dashboard identifies each file from its columns and separates Nuvei EU/AE using SafeCharge IDs."
-        ),
-    )
-    st.caption("You may upload only the files available for the day; incomplete routes are skipped automatically.")
+    st.markdown("**Backend business-date rule**")
+    st.caption("Backend `Created At` is converted from UTC+3 to GMT+6. `Updated At` is audit-only.")
+    st.caption("Uploaded files and generated results remain only in the current Streamlit session.")
 
-    if bulk_files:
-        with st.expander(f"Selected files ({len(bulk_files)})", expanded=False):
-            for uploaded in bulk_files:
-                st.write(f"• {uploaded.name}")
 
-    run_clicked = st.button("Detect files and run reconciliation", type="primary", use_container_width=True)
-
-uploaded_count = len(bulk_files or [])
-ready_cols = st.columns(4)
-ready_cols[0].metric("Files uploaded", uploaded_count)
-ready_cols[1].metric("Target date", selected_date.strftime("%d %b %Y"))
-ready_cols[2].metric("Timezone", "GMT+6")
-ready_cols[3].metric("Amount tolerance", f"{amount_tolerance:.2f}")
-
-# Create a stable run signature so downloads/results remain until inputs change.
-def signature() -> str:
+def files_signature(files, workspace: str) -> str:
     digest = hashlib.sha256()
+    digest.update(workspace.encode())
     digest.update(str(selected_date).encode())
     digest.update(str(amount_tolerance).encode())
-    for uploaded in sorted(bulk_files or [], key=lambda item: (item.name, len(item.getvalue()))):
+    for uploaded in sorted(files or [], key=lambda item: (item.name, len(item.getvalue()))):
         digest.update(uploaded.name.encode())
         digest.update(uploaded.getvalue())
     return digest.hexdigest()
 
-current_signature = signature()
-
-if run_clicked:
-    if uploaded_count == 0:
-        st.warning("Upload at least one orchestrator file and its related PSP file.")
-    else:
-        with st.spinner("Detecting reports, applying GMT+6 rules and reconciling approved transactions…"):
-            assigned_files, upload_mapping = auto_assign_uploaded_files(bulk_files, selected_date)
-            results, file_audit = run_all_reconciliations(assigned_files, selected_date, amount_tolerance)
-            st.session_state["recon_results"] = results
-            st.session_state["file_audit"] = file_audit
-            st.session_state["upload_mapping"] = upload_mapping
-            st.session_state["assigned_slots"] = sorted(assigned_files)
-            st.session_state["recon_signature"] = current_signature
-            st.session_state["recon_date"] = selected_date
-
-results = st.session_state.get("recon_results", [])
-file_audit = st.session_state.get("file_audit", [])
-upload_mapping = st.session_state.get("upload_mapping", [])
-assigned_slots = st.session_state.get("assigned_slots", [])
-results_are_current = st.session_state.get("recon_signature") == current_signature
-
-if results and not results_are_current:
-    st.info("The uploaded files or settings changed. Click **Detect files and run reconciliation** to refresh the results.")
-
-if upload_mapping:
-    with st.expander("Auto-detected file mapping", expanded=not results):
-        mapping_df = pd.DataFrame(upload_mapping)
-        st.dataframe(mapping_df, use_container_width=True, hide_index=True)
-        needs_review = mapping_df[~mapping_df["Status"].isin(["Assigned", "Assigned by filename", "Assigned by elimination"])]
-        if not needs_review.empty:
-            st.warning("Some uploaded files were not assigned or were treated as duplicates. Review the mapping table above.")
-        else:
-            st.success(f"All {len(mapping_df)} uploaded files were assigned automatically.")
-
-if not results:
-    st.info(
-        "Upload all available orchestrator and PSP files together, choose the GMT+6 date, and run the reconciliation. "
-        "The dashboard detects file types automatically, and only routes with both required files are processed."
-    )
-
-    st.subheader("Built-in reconciliation logic")
-    logic_preview = pd.DataFrame(
-        [
-            ["BridgerPay", "Nuvei EU/AE", "Nuvei Transaction ID = BP pspOrderId", "SafeCharge MID EU/AE"],
-            ["BridgerPay", "TrustPayment", "Reference = BP pspOrderId", "Settle 0/100 + AUTH + Error 0"],
-            ["BridgerPay", "Payabl", "Tx-Id = BP transactionId", "UTC+2 → GMT+6"],
-            ["BridgerPay", "Paysafe", "Transaction ID = BP transactionId", "Merchant ID begins BP_"],
-            ["BridgerPay", "Unlimit", "Payment ID = BP pspOrderId", "CardPay in BP"],
-            ["BridgerPay", "Paystra/Axcess", "TransactionId = BP pspOrderId", "DB + ACK + 000.000.000"],
-            ["BridgerPay", "PayPal", "Transaction ID = BP pspOrderId", "UTC-7 → GMT+6; Gross"],
-            ["PayProcc", "Dlocal", "Reference = Gateway ID", "Validated date UTC → GMT+6"],
-            ["PayProcc", "Skrill", "Reference = Gateway ID", "CEST UTC+2 → GMT+6"],
-            ["PayProcc", "Paysafe Local", "Transaction ID = Gateway ID", "Non-BP_ rows"],
-        ],
-        columns=["Orchestrator", "PSP", "Primary match", "Filter/timezone"],
-    )
-    st.dataframe(logic_preview, use_container_width=True, hide_index=True)
-    st.stop()
-
-summary = summary_dataframe(results)
-all_exceptions = exceptions_dataframe(results)
-
-# KPI row.
-processed = len(summary)
-full_match = int(summary["Status"].eq("FULL MATCH").sum()) if not summary.empty else 0
-review = int(summary["Status"].eq("REVIEW REQUIRED").sum()) if not summary.empty else 0
-exception_count = len(all_exceptions)
-matched_total = int(summary["Matched"].sum()) if "Matched" in summary else 0
-
-kpis = st.columns(5)
-kpis[0].metric("Routes processed", processed)
-kpis[1].metric("Full match", full_match)
-kpis[2].metric("Review required", review)
-kpis[3].metric("Matched transactions", f"{matched_total:,}")
-kpis[4].metric("Exception rows", f"{exception_count:,}")
-
-# Prominent route-level summary requested for daily review.
-st.subheader("PSP and orchestrator match summary")
-summary_table_columns = [
-    "PSP",
-    "Orchestrator",
-    "PSP Count",
-    "Orchestrator Count",
-    "Matched",
-    "Unmatched",
-    "Order Mismatch",
-    "Amount Mismatch",
-    "Currency Mismatch",
-    "Status",
-]
-summary_table_available = [c for c in summary_table_columns if c in summary.columns]
-summary_table = summary.sort_values(["Orchestrator", "PSP"])[summary_table_available]
-st.dataframe(summary_table, use_container_width=True, hide_index=True)
-st.caption(
-    "Unmatched = PSP-only + orchestrator-only transactions. "
-    "Order, amount, and currency mismatches are counted separately. "
-    "Timestamp differences are shown only as audit evidence and are not counted as mismatches."
-)
-
-# Downloads.
-report_bytes = build_excel_report(results, file_audit, st.session_state.get("recon_date", selected_date), upload_mapping)
-download_cols = st.columns([1, 1, 2])
-download_cols[0].download_button(
-    "Download consolidated Excel",
-    data=report_bytes,
-    file_name=f"payment_reconciliation_{selected_date.isoformat()}_GMT6.xlsx",
-    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-)
-if all_exceptions.empty:
-    exception_csv = b"No exceptions found.\n"
-else:
-    exception_csv = all_exceptions.to_csv(index=False).encode("utf-8-sig")
-download_cols[1].download_button(
-    "Download exceptions CSV",
-    data=exception_csv,
-    file_name=f"reconciliation_exceptions_{selected_date.isoformat()}_GMT6.csv",
-    mime="text/csv",
-    use_container_width=True,
-)
-download_cols[2].caption("Excel includes the consolidated summary, file audit, all exceptions, and one detailed sheet per reconciliation route.")
-
-status_order = {"REVIEW REQUIRED": 0, "MATCHED WITH AMOUNT VARIANCES": 1, "FULL MATCH": 2, "NO APPROVED DATA": 3}
-summary_display = summary.copy()
-summary_display["_order"] = summary_display["Status"].map(status_order).fillna(9)
-summary_display = summary_display.sort_values(["_order", "Orchestrator", "PSP"]).drop(columns="_order")
-
-overview_tab, bp_tab, pp_tab, exceptions_tab, audit_tab, logic_tab = st.tabs(
-    ["Overview", "BridgerPay", "PayProcc", "Exceptions", "File audit", "Logic reference"]
-)
-
-with overview_tab:
-    st.subheader("Reconciliation overview")
-    columns = [
-        "Orchestrator", "PSP", "Status", "PSP Count", "Orchestrator Count", "Matched",
-        "Unmatched", "PSP Only", "Orchestrator Only", "Order Mismatch", "Amount Mismatch", "Currency Mismatch",
-    ]
-    available = [c for c in columns if c in summary_display.columns]
-    st.dataframe(summary_display[available], use_container_width=True, hide_index=True)
-
-    if not summary.empty:
-        chart_df = summary.groupby("Status", as_index=False).size().rename(columns={"size": "Routes"})
-        st.bar_chart(chart_df.set_index("Status"))
-
-    st.subheader("Priority review")
-    review_df = summary_display[summary_display["Status"].isin(["REVIEW REQUIRED", "MATCHED WITH AMOUNT VARIANCES"])]
-    if review_df.empty:
-        st.success("No routes require review.")
-    else:
-        st.dataframe(review_df[available], use_container_width=True, hide_index=True)
-
 
 def status_badge(status: str) -> str:
     if status == "FULL MATCH":
-        cls = "status-full"
+        css_class = "status-full"
     elif status == "MATCHED WITH AMOUNT VARIANCES":
-        cls = "status-variance"
+        css_class = "status-variance"
     elif status == "NO APPROVED DATA":
-        cls = "status-empty"
+        css_class = "status-empty"
     else:
-        cls = "status-review"
-    return f'<span class="{cls}">{status}</span>'
+        css_class = "status-review"
+    return f'<span class="{css_class}">{status}</span>'
 
 
-def summary_metric(result, key: str) -> int:
-    """Read both current and legacy summary dictionaries safely."""
-    data = result.summary or {}
-    if key == "Unmatched":
-        value = data.get(key)
-        if value is None:
-            value = (data.get("PSP Only", 0) or 0) + (data.get("Orchestrator Only", 0) or 0)
-    else:
-        value = data.get(key, 0)
+def safe_int(value) -> int:
     try:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
 
 
-def render_orchestrator(orchestrator: str):
-    selected = [r for r in results if r.orchestrator == orchestrator]
-    if not selected:
-        st.info(f"No {orchestrator} routes were processed. Upload the orchestrator report and at least one related PSP file.")
+def recognized_count(mapping: list[dict]) -> int:
+    if not mapping:
+        return 0
+    return sum(1 for row in mapping if row.get("Status") in {"Assigned", "Assigned by filename", "Assigned by elimination"})
+
+
+def render_mapping(mapping: list[dict], *, title: str = "Auto-detected file mapping") -> None:
+    if not mapping:
         return
-    for result in selected:
-        with st.expander(f"{result.psp} — {result.status}", expanded=result.status != "FULL MATCH"):
-            st.markdown(status_badge(result.status), unsafe_allow_html=True)
-            cols = st.columns(7)
-            cols[0].metric("PSP", f"{summary_metric(result, 'PSP Count'):,}")
-            cols[1].metric("Orchestrator", f"{summary_metric(result, 'Orchestrator Count'):,}")
-            cols[2].metric("Matched", f"{summary_metric(result, 'Matched'):,}")
-            cols[3].metric("Unmatched", f"{summary_metric(result, 'Unmatched'):,}")
-            cols[4].metric("Order mismatch", f"{summary_metric(result, 'Order Mismatch'):,}")
-            cols[5].metric("Amount mismatch", f"{summary_metric(result, 'Amount Mismatch'):,}")
-            cols[6].metric("Currency mismatch", f"{summary_metric(result, 'Currency Mismatch'):,}")
-
-            if result.notes:
-                st.caption(" • ".join(result.notes))
-
-            detail_tab, exception_tab, source_tab, audit_subtab = st.tabs(["Reconciliation", "Exceptions", "Source rows", "Audit"])
-            with detail_tab:
-                st.dataframe(result.reconciliation, use_container_width=True, hide_index=True, height=420)
-            with exception_tab:
-                if result.exceptions.empty:
-                    st.success("No exceptions for this route.")
-                else:
-                    st.dataframe(result.exceptions, use_container_width=True, hide_index=True, height=360)
-            with source_tab:
-                left, right = st.columns(2)
-                with left:
-                    st.markdown(f"**{result.psp} approved rows**")
-                    st.dataframe(result.psp_source, use_container_width=True, hide_index=True, height=330)
-                with right:
-                    st.markdown(f"**{result.orchestrator} approved rows**")
-                    st.dataframe(result.orchestrator_source, use_container_width=True, hide_index=True, height=330)
-            with audit_subtab:
-                st.json(result.audit)
+    with st.expander(title, expanded=False):
+        mapping_df = pd.DataFrame(mapping)
+        st.dataframe(mapping_df, use_container_width=True, hide_index=True)
+        needs_review = mapping_df[~mapping_df["Status"].isin(["Assigned", "Assigned by filename", "Assigned by elimination"])]
+        if needs_review.empty:
+            st.success(f"All {len(mapping_df)} uploaded files were assigned automatically.")
+        else:
+            st.warning("Some files were unrecognized, duplicated, or require review. Check the mapping table.")
 
 
-with bp_tab:
-    render_orchestrator("BridgerPay")
+def render_psp_workspace() -> None:
+    st.markdown('<div class="flow-title">PSP → Orchestrator</div>', unsafe_allow_html=True)
+    st.caption("Existing PSP reconciliation workspace. Upload PSP reports together with BridgerPay and PayProcc reports.")
 
-with pp_tab:
-    render_orchestrator("PayProcc")
+    upload_col, run_col = st.columns([4, 1])
+    with upload_col:
+        files = st.file_uploader(
+            "Upload PSP and orchestrator reports",
+            type=["csv", "xlsx"],
+            accept_multiple_files=True,
+            key="psp_bulk_files",
+            help="The dashboard identifies reports from their columns and automatically separates Nuvei EU/AE routes.",
+        )
+    with run_col:
+        st.write("")
+        st.write("")
+        run_clicked = st.button(
+            "Run PSP reconciliation",
+            type="primary",
+            use_container_width=True,
+            key="psp_run_button",
+        )
 
-with exceptions_tab:
-    st.subheader("All reconciliation exceptions")
-    if all_exceptions.empty:
-        st.success("No exceptions found in the processed routes.")
-    else:
-        orchestrators = ["All"] + sorted(all_exceptions["Orchestrator"].dropna().unique().tolist())
-        selected_orch = st.selectbox("Filter orchestrator", orchestrators)
-        filtered = all_exceptions if selected_orch == "All" else all_exceptions[all_exceptions["Orchestrator"] == selected_orch]
-        st.dataframe(filtered, use_container_width=True, hide_index=True, height=520)
+    uploaded = len(files or [])
+    current_signature = files_signature(files, "psp")
 
-with audit_tab:
-    st.subheader("Auto-detected upload mapping")
-    if upload_mapping:
-        st.dataframe(pd.DataFrame(upload_mapping), use_container_width=True, hide_index=True)
-    else:
-        st.info("Run the reconciliation to see automatic file assignments.")
+    if files:
+        with st.expander(f"Selected PSP-stage files ({uploaded})", expanded=False):
+            for item in files:
+                st.write(f"• {item.name}")
 
-    st.subheader("File readiness and parsing audit")
-    audit_df = pd.DataFrame(file_audit)
-    st.dataframe(audit_df, use_container_width=True, hide_index=True)
-    error_rows = audit_df[audit_df["Status"].isin(["Error", "Reconciliation error"])] if not audit_df.empty else pd.DataFrame()
-    if not error_rows.empty:
-        st.error("One or more files could not be processed. Review the Error column above.")
+    if run_clicked:
+        if not files:
+            st.warning("Upload at least one orchestrator file and its related PSP report.")
+        else:
+            with st.spinner("Detecting reports, applying GMT+6 rules, and reconciling PSP transactions…"):
+                assigned, mapping = auto_assign_uploaded_files(files, selected_date)
+                results, audit = run_all_reconciliations(assigned, selected_date, amount_tolerance)
+                st.session_state["psp_results"] = results
+                st.session_state["psp_audit"] = audit
+                st.session_state["psp_mapping"] = mapping
+                st.session_state["psp_signature"] = current_signature
+                st.session_state["psp_date"] = selected_date
 
-with logic_tab:
-    st.subheader("Configured business logic")
-    logic_rows = []
-    for result in results:
-        logic_rows.append({
+    results = st.session_state.get("psp_results", [])
+    audit = st.session_state.get("psp_audit", [])
+    mapping = st.session_state.get("psp_mapping", [])
+    is_current = st.session_state.get("psp_signature") == current_signature
+
+    if results and not is_current:
+        st.info("The PSP-stage files or settings changed. Click **Run PSP reconciliation** to refresh.")
+
+    render_mapping(mapping)
+
+    summary = summary_dataframe(results)
+    exceptions = exceptions_dataframe(results)
+
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("Files uploaded", uploaded)
+    metric_cols[1].metric("Recognized files", recognized_count(mapping))
+    metric_cols[2].metric("Routes processed", len(summary))
+    metric_cols[3].metric("Full match", int(summary["Status"].eq("FULL MATCH").sum()) if not summary.empty else 0)
+    metric_cols[4].metric("Review required", int(summary["Status"].eq("REVIEW REQUIRED").sum()) if not summary.empty else 0)
+    metric_cols[5].metric("Matched transactions", f"{int(summary['Matched'].sum()) if 'Matched' in summary else 0:,}")
+
+    if not results:
+        st.info("Upload the PSP-stage files and run the reconciliation. Only routes with both required sides are processed.")
+        st.subheader("Configured PSP-stage routes")
+        preview = pd.DataFrame(
+            [
+                ["Nuvei EU/AE", "BridgerPay", "Transaction ID = pspOrderId"],
+                ["TrustPayment", "BridgerPay", "Reference = pspOrderId"],
+                ["Payabl", "BridgerPay", "Tx-Id = transactionId"],
+                ["Paysafe", "BridgerPay", "Transaction ID = transactionId"],
+                ["Unlimit", "BridgerPay", "Payment ID = pspOrderId"],
+                ["Paystra / Axcess", "BridgerPay", "TransactionId = pspOrderId"],
+                ["PayPal", "BridgerPay", "Transaction ID = pspOrderId"],
+                ["Dlocal", "PayProcc", "Reference = Gateway ID"],
+                ["Skrill", "PayProcc", "Reference = Gateway ID"],
+                ["Paysafe Local", "PayProcc", "Transaction ID = Gateway ID"],
+            ],
+            columns=["PSP", "Orchestrator", "Primary match"],
+        )
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+        return
+
+    st.subheader("PSP and orchestrator match summary")
+    columns = [
+        "PSP", "Orchestrator", "PSP Count", "Orchestrator Count", "Matched", "Unmatched",
+        "Order Mismatch", "Amount Mismatch", "Currency Mismatch", "Status",
+    ]
+    available = [column for column in columns if column in summary.columns]
+    st.dataframe(summary.sort_values(["Orchestrator", "PSP"])[available], use_container_width=True, hide_index=True)
+    st.caption("Timestamp differences remain audit-only. Order, amount, and currency checks are counted separately.")
+
+    report_bytes = build_excel_report(results, audit, st.session_state.get("psp_date", selected_date), mapping)
+    download_cols = st.columns([1, 1, 2])
+    download_cols[0].download_button(
+        "Download PSP-stage Excel",
+        data=report_bytes,
+        file_name=f"psp_to_orchestrator_{selected_date.isoformat()}_GMT6.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    exception_csv = exceptions.to_csv(index=False).encode("utf-8-sig") if not exceptions.empty else b"No exceptions found.\n"
+    download_cols[1].download_button(
+        "Download exceptions CSV",
+        data=exception_csv,
+        file_name=f"psp_to_orchestrator_exceptions_{selected_date.isoformat()}_GMT6.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    download_cols[2].caption("The Excel file includes summary, upload mapping, file audit, exceptions, and route details.")
+
+    status_order = {"REVIEW REQUIRED": 0, "MATCHED WITH AMOUNT VARIANCES": 1, "FULL MATCH": 2, "NO APPROVED DATA": 3}
+    display = summary.copy()
+    display["_order"] = display["Status"].map(status_order).fillna(9)
+    display = display.sort_values(["_order", "Orchestrator", "PSP"]).drop(columns="_order")
+
+    overview_tab, bp_tab, pp_tab, exception_tab, audit_tab, logic_tab = st.tabs(
+        ["Overview", "BridgerPay", "PayProcc", "Exceptions", "File audit", "Logic reference"]
+    )
+
+    with overview_tab:
+        overview_columns = [
+            "Orchestrator", "PSP", "Status", "PSP Count", "Orchestrator Count", "Matched",
+            "Unmatched", "PSP Only", "Orchestrator Only", "Order Mismatch", "Amount Mismatch", "Currency Mismatch",
+        ]
+        st.dataframe(display[[c for c in overview_columns if c in display.columns]], use_container_width=True, hide_index=True)
+        review_df = display[display["Status"].isin(["REVIEW REQUIRED", "MATCHED WITH AMOUNT VARIANCES"])]
+        st.subheader("Priority review")
+        if review_df.empty:
+            st.success("No PSP-stage routes require review.")
+        else:
+            st.dataframe(review_df[[c for c in overview_columns if c in review_df.columns]], use_container_width=True, hide_index=True)
+
+    def render_psp_orchestrator(orchestrator: str) -> None:
+        selected = [result for result in results if result.orchestrator == orchestrator]
+        if not selected:
+            st.info(f"No {orchestrator} routes were processed.")
+            return
+        for result in selected:
+            with st.expander(f"{result.psp} — {result.status}", expanded=result.status != "FULL MATCH"):
+                st.markdown(status_badge(result.status), unsafe_allow_html=True)
+                values = result.summary or {}
+                metrics = st.columns(7)
+                metrics[0].metric("PSP", f"{safe_int(values.get('PSP Count')):,}")
+                metrics[1].metric("Orchestrator", f"{safe_int(values.get('Orchestrator Count')):,}")
+                metrics[2].metric("Matched", f"{safe_int(values.get('Matched')):,}")
+                metrics[3].metric("Unmatched", f"{safe_int(values.get('Unmatched')):,}")
+                metrics[4].metric("Order mismatch", f"{safe_int(values.get('Order Mismatch')):,}")
+                metrics[5].metric("Amount mismatch", f"{safe_int(values.get('Amount Mismatch')):,}")
+                metrics[6].metric("Currency mismatch", f"{safe_int(values.get('Currency Mismatch')):,}")
+                if result.notes:
+                    st.caption(" • ".join(result.notes))
+                detail, exc, source, route_audit = st.tabs(["Reconciliation", "Exceptions", "Source rows", "Audit"])
+                with detail:
+                    st.dataframe(result.reconciliation, use_container_width=True, hide_index=True, height=430)
+                with exc:
+                    if result.exceptions.empty:
+                        st.success("No exceptions for this route.")
+                    else:
+                        st.dataframe(result.exceptions, use_container_width=True, hide_index=True, height=380)
+                with source:
+                    left, right = st.columns(2)
+                    with left:
+                        st.markdown(f"**{result.psp} approved rows**")
+                        st.dataframe(result.psp_source, use_container_width=True, hide_index=True, height=330)
+                    with right:
+                        st.markdown(f"**{result.orchestrator} approved rows**")
+                        st.dataframe(result.orchestrator_source, use_container_width=True, hide_index=True, height=330)
+                with route_audit:
+                    st.json(result.audit)
+
+    with bp_tab:
+        render_psp_orchestrator("BridgerPay")
+    with pp_tab:
+        render_psp_orchestrator("PayProcc")
+    with exception_tab:
+        if exceptions.empty:
+            st.success("No PSP-stage exceptions found.")
+        else:
+            options = ["All"] + sorted(exceptions["Orchestrator"].dropna().unique().tolist())
+            selected_orchestrator = st.selectbox("Filter orchestrator", options, key="psp_exception_filter")
+            filtered = exceptions if selected_orchestrator == "All" else exceptions[exceptions["Orchestrator"] == selected_orchestrator]
+            st.dataframe(filtered, use_container_width=True, hide_index=True, height=540)
+    with audit_tab:
+        st.subheader("Upload mapping")
+        st.dataframe(pd.DataFrame(mapping), use_container_width=True, hide_index=True)
+        st.subheader("File readiness")
+        st.dataframe(pd.DataFrame(audit), use_container_width=True, hide_index=True)
+    with logic_tab:
+        logic_rows = [{
             "Orchestrator": result.orchestrator,
             "PSP": result.psp,
             "Status": result.status,
             "Notes": " | ".join(result.notes),
             "Amount tolerance": result.audit.get("Amount tolerance"),
-            "Timestamp handling": result.audit.get("Timestamp comparison"),
-        })
-    st.dataframe(pd.DataFrame(logic_rows), use_container_width=True, hide_index=True)
-    st.markdown(
-        """
-**Operational safeguards included**
+        } for result in results]
+        st.dataframe(pd.DataFrame(logic_rows), use_container_width=True, hide_index=True)
 
-- Only approved/successful payment records are reconciled; fee, refund, reversal, RG and CF lifecycle rows are excluded according to each PSP rule.
-- Every source is converted or interpreted in GMT+6 before the selected date is applied. Timestamps remain visible for audit evidence but do not create mismatch counts.
-- Duplicate or blank matching keys are isolated as exceptions instead of producing duplicate joins.
-- Paysafe routing is split automatically: `BP_` merchant IDs go to BridgerPay; non-`BP_` IDs go to PayProcc.
-- Dlocal amount variances are reported separately, so reference reconciliation is not confused with FX/gross-amount differences.
-"""
+
+def render_backend_workspace() -> None:
+    st.markdown('<div class="flow-title">Orchestrator → Backend API</div>', unsafe_allow_html=True)
+    st.caption("Upload the Backend API file together with available BridgerPay, PayProcc, Coinsbuy, Confirmo, and ZEN reports.")
+    st.info("Backend daily selection uses **Created At**, converted from UTC+3 to GMT+6. Updated At is retained for audit only.")
+
+    upload_col, run_col = st.columns([4, 1])
+    with upload_col:
+        files = st.file_uploader(
+            "Upload backend and orchestrator reports",
+            type=["csv", "xlsx"],
+            accept_multiple_files=True,
+            key="backend_bulk_files",
+            help="The dashboard detects the Backend API file and each orchestrator report from exported columns.",
+        )
+    with run_col:
+        st.write("")
+        st.write("")
+        run_clicked = st.button(
+            "Run backend reconciliation",
+            type="primary",
+            use_container_width=True,
+            key="backend_run_button",
+        )
+
+    uploaded = len(files or [])
+    current_signature = files_signature(files, "backend")
+
+    if files:
+        with st.expander(f"Selected backend-stage files ({uploaded})", expanded=False):
+            for item in files:
+                st.write(f"• {item.name}")
+
+    if run_clicked:
+        if not files:
+            st.warning("Upload the Backend API report and at least one orchestrator report.")
+        else:
+            with st.spinner("Detecting backend-stage reports and reconciling with Backend Created At…"):
+                assigned, mapping = auto_assign_backend_uploaded_files(files, selected_date)
+                results, audit = run_backend_reconciliations(assigned, selected_date, amount_tolerance)
+                st.session_state["backend_results"] = results
+                st.session_state["backend_audit"] = audit
+                st.session_state["backend_mapping"] = mapping
+                st.session_state["backend_signature"] = current_signature
+                st.session_state["backend_date"] = selected_date
+
+    results = st.session_state.get("backend_results", [])
+    audit = st.session_state.get("backend_audit", [])
+    mapping = st.session_state.get("backend_mapping", [])
+    is_current = st.session_state.get("backend_signature") == current_signature
+
+    if results and not is_current:
+        st.info("The backend-stage files or settings changed. Click **Run backend reconciliation** to refresh.")
+
+    render_mapping(mapping)
+
+    summary = backend_summary_dataframe(results)
+    exceptions = backend_exceptions_dataframe(results)
+
+    total_orchestrator = int(summary["Orchestrator Count"].sum()) if "Orchestrator Count" in summary else 0
+    total_matched = int(summary["Matched"].sum()) if "Matched" in summary else 0
+    metric_cols = st.columns(6)
+    metric_cols[0].metric("Files uploaded", uploaded)
+    metric_cols[1].metric("Recognized files", recognized_count(mapping))
+    metric_cols[2].metric("Routes processed", len(summary))
+    metric_cols[3].metric("Orchestrator transactions", f"{total_orchestrator:,}")
+    metric_cols[4].metric("Matched", f"{total_matched:,}")
+    metric_cols[5].metric("Exception rows", f"{len(exceptions):,}")
+
+    if not results:
+        st.info("Upload the backend file and available orchestrator reports, then run this workspace.")
+        st.subheader("Configured backend-stage routes")
+        preview = pd.DataFrame(
+            [
+                ["BridgerPay", "Bridger Pay", "merchantOrderId = Backend Transaction ID", "amount = Grand Total"],
+                ["PayProcc", "Pay Procc", "Merchant Order ID = Backend Transaction ID", "USD/Applied USD = Grand Total"],
+                ["Coinsbuy", "Crypto", "Operation ID number = Backend Transaction ID", "Amount × Rate; internal transfers excluded"],
+                ["Confirmo", "Confirmo", "ID = Backend Transaction ID", "Reference = Tracking ID"],
+                ["ZEN", "Zen Pay", "merchant_transaction_id = Backend Transaction ID", "Apple Pay and Google Pay only"],
+            ],
+            columns=["Orchestrator", "Backend Gateway", "Primary match", "Additional rule"],
+        )
+        st.dataframe(preview, use_container_width=True, hide_index=True)
+        return
+
+    st.subheader("Orchestrator and backend match summary")
+    columns = [
+        "Orchestrator", "Backend Gateway", "Orchestrator Count", "Backend Created-Date Count",
+        "Matched", "Same Created Date", "Prior Backend Created Date", "Next Backend Created Date",
+        "Orchestrator Only", "Backend Adjacent Matched", "Backend Adjacent Report Needed",
+        "Amount Mismatch", "Amount Variance", "Tracking Mismatch", "Currency Mismatch", "Status",
+    ]
+    available = [column for column in columns if column in summary.columns]
+    st.dataframe(summary[available], use_container_width=True, hide_index=True)
+    st.caption(
+        "The orchestrator report is the business-date anchor. Backend Created At selects backend daily rows. "
+        "Adjacent-date matches are shown separately to prevent false missing-transaction counts."
     )
+
+    report_bytes = build_backend_excel_report(results, audit, st.session_state.get("backend_date", selected_date), mapping)
+    download_cols = st.columns([1, 1, 2])
+    download_cols[0].download_button(
+        "Download backend-stage Excel",
+        data=report_bytes,
+        file_name=f"orchestrator_to_backend_{selected_date.isoformat()}_GMT6.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    exception_csv = exceptions.to_csv(index=False).encode("utf-8-sig") if not exceptions.empty else b"No exceptions found.\n"
+    download_cols[1].download_button(
+        "Download exceptions CSV",
+        data=exception_csv,
+        file_name=f"orchestrator_to_backend_exceptions_{selected_date.isoformat()}_GMT6.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+    download_cols[2].caption("The backend-stage Excel is separate from the PSP-stage workbook to keep the evidence organized.")
+
+    overview_tab, bp_tab, pp_tab, cb_tab, confirmo_tab, zen_tab, exception_tab, audit_tab, logic_tab = st.tabs(
+        ["Overview", "BridgerPay", "PayProcc", "Coinsbuy", "Confirmo", "ZEN", "Exceptions", "File audit", "Logic reference"]
+    )
+
+    with overview_tab:
+        overview_columns = [
+            "Orchestrator", "Backend Gateway", "Status", "Orchestrator Count", "Backend Created-Date Count",
+            "Matched", "Unmatched", "Orchestrator Only", "Backend Adjacent Report Needed",
+            "Raw Amount Differences", "Amount Mismatch", "Amount Variance", "Tracking Mismatch", "Currency Mismatch",
+        ]
+        st.dataframe(summary[[c for c in overview_columns if c in summary.columns]], use_container_width=True, hide_index=True)
+        review = summary[summary["Status"].isin(["REVIEW REQUIRED", "MATCHED WITH AMOUNT VARIANCES"])]
+        st.subheader("Priority review")
+        if review.empty:
+            st.success("No backend-stage routes require review.")
+        else:
+            st.dataframe(review[[c for c in overview_columns if c in review.columns]], use_container_width=True, hide_index=True)
+
+    def render_backend_route(orchestrator: str) -> None:
+        selected = [result for result in results if result.orchestrator == orchestrator]
+        if not selected:
+            st.info(f"No {orchestrator} route was processed. Upload both Backend API and {orchestrator} reports.")
+            return
+        result = selected[0]
+        st.markdown(status_badge(result.status), unsafe_allow_html=True)
+        values = result.summary or {}
+        metrics = st.columns(8)
+        metrics[0].metric("Orchestrator", f"{safe_int(values.get('Orchestrator Count')):,}")
+        metrics[1].metric("Backend created date", f"{safe_int(values.get('Backend Created-Date Count')):,}")
+        metrics[2].metric("Matched", f"{safe_int(values.get('Matched')):,}")
+        metrics[3].metric("Orchestrator only", f"{safe_int(values.get('Orchestrator Only')):,}")
+        metrics[4].metric("Adjacent check", f"{safe_int(values.get('Backend Adjacent Report Needed')):,}")
+        metrics[5].metric("Amount mismatch", f"{safe_int(values.get('Amount Mismatch')):,}")
+        metrics[6].metric("Tracking mismatch", f"{safe_int(values.get('Tracking Mismatch')):,}")
+        metrics[7].metric("Currency mismatch", f"{safe_int(values.get('Currency Mismatch')):,}")
+        if result.notes:
+            st.caption(" • ".join(result.notes))
+
+        detail, exc, sources, route_audit = st.tabs(["Reconciliation", "Exceptions", "Source rows", "Audit"])
+        with detail:
+            st.dataframe(result.reconciliation, use_container_width=True, hide_index=True, height=500)
+        with exc:
+            if result.exceptions.empty:
+                st.success("No exceptions for this route.")
+            else:
+                st.dataframe(result.exceptions, use_container_width=True, hide_index=True, height=430)
+        with sources:
+            left, right = st.columns(2)
+            with left:
+                st.markdown(f"**{result.orchestrator} selected business-date rows**")
+                st.dataframe(result.orchestrator_source, use_container_width=True, hide_index=True, height=360)
+            with right:
+                st.markdown("**Backend rows selected by Created At**")
+                st.dataframe(result.backend_source, use_container_width=True, hide_index=True, height=360)
+        with route_audit:
+            st.json(result.audit)
+
+    with bp_tab:
+        render_backend_route("BridgerPay")
+    with pp_tab:
+        render_backend_route("PayProcc")
+    with cb_tab:
+        render_backend_route("Coinsbuy")
+    with confirmo_tab:
+        render_backend_route("Confirmo")
+    with zen_tab:
+        render_backend_route("ZEN")
+    with exception_tab:
+        if exceptions.empty:
+            st.success("No backend-stage exceptions found.")
+        else:
+            options = ["All"] + sorted(exceptions["Orchestrator"].dropna().unique().tolist())
+            selected_orchestrator = st.selectbox("Filter orchestrator", options, key="backend_exception_filter")
+            filtered = exceptions if selected_orchestrator == "All" else exceptions[exceptions["Orchestrator"] == selected_orchestrator]
+            st.dataframe(filtered, use_container_width=True, hide_index=True, height=560)
+    with audit_tab:
+        st.subheader("Upload mapping")
+        st.dataframe(pd.DataFrame(mapping), use_container_width=True, hide_index=True)
+        st.subheader("File readiness")
+        st.dataframe(pd.DataFrame(audit), use_container_width=True, hide_index=True)
+    with logic_tab:
+        logic_rows = [{
+            "Orchestrator": result.orchestrator,
+            "Backend Gateway": result.backend_gateway,
+            "Status": result.status,
+            "Backend date field": result.audit.get("Backend business date field"),
+            "Timezone": result.audit.get("Backend timezone conversion"),
+            "Notes": " | ".join(result.notes),
+        } for result in results]
+        st.dataframe(pd.DataFrame(logic_rows), use_container_width=True, hide_index=True)
+        st.markdown(
+            """
+**Backend-stage safeguards**
+
+- Backend daily population is selected using `Created At` after UTC+3 → GMT+6 conversion.
+- `Updated At` remains available for audit evidence but does not move a transaction into another business date.
+- Orchestrator transactions are matched against the complete supplied backend file to avoid false next-day missing records.
+- Coinsbuy deposits over 2,500 without a Tracking ID are excluded as internal transfers.
+- ZEN includes only Apple Pay and Google Pay purchase channels; plain card traffic remains under BridgerPay.
+"""
+        )
+
+
+psp_flow_tab, backend_flow_tab = st.tabs(["1. PSP → Orchestrator", "2. Orchestrator → Backend API"])
+with psp_flow_tab:
+    render_psp_workspace()
+with backend_flow_tab:
+    render_backend_workspace()

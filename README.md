@@ -1,42 +1,59 @@
-# Payment Reconciliation Dashboard v2.4
+# Payment Reconciliation Dashboard v2.5
 
-This Streamlit dashboard performs bulk PSP-to-orchestrator reconciliation in GMT+6.
+This Streamlit dashboard now separates the complete payment flow into two independent workspaces:
 
-## Important deployment fix
+1. **PSP → Orchestrator**
+2. **Orchestrator → Backend API**
 
-Version 2.4 uses `reconciliation_engine_v24.py` instead of the old generic engine filename. This prevents Streamlit Cloud from importing a stale `reconciliation_engine.py` from a previous release.
+The separation keeps uploads, summaries, exceptions, source rows, file audits, and downloads organized instead of placing every reconciliation on one screen.
 
-Upload **all files from this package together** to the root of the GitHub repository:
+## Deployment files
+
+Upload all files from this package together to the root of the GitHub repository:
 
 - `app.py`
-- `reconciliation_engine_v24.py`
+- `reconciliation_engine_v25.py`
 - `requirements.txt`
 - `.streamlit/config.toml`
 - `RECONCILIATION_LOGIC.md`
+- `DEPLOYMENT_CHECKLIST.md`
 
-The old `reconciliation_engine.py` may be deleted. It is not used by v2.4.
+Delete or ignore older engine files such as `reconciliation_engine.py` and `reconciliation_engine_v24.py`. Version 2.5 imports only `reconciliation_engine_v25.py`.
 
 ## Streamlit Cloud update steps
 
 1. Extract this ZIP.
-2. In GitHub, replace `app.py` and upload `reconciliation_engine_v24.py` plus the other package files.
-3. Delete the old `reconciliation_engine.py` to avoid confusion.
-4. Commit the changes.
-5. In Streamlit Cloud, open **Manage app → Reboot app**.
-6. Confirm the main file path is `app.py`.
+2. Replace `app.py` in the GitHub repository.
+3. Upload `reconciliation_engine_v25.py` and the remaining package files.
+4. Delete old engine files to avoid confusion.
+5. Commit the changes.
+6. In Streamlit Cloud, open **Manage app → Reboot app**.
+7. Confirm the main file path is `app.py`.
 
-If the engine file is missing or the versions differ, the app now displays a clear deployment message instead of a redacted ImportError.
+## PSP → Orchestrator workspace
 
-## Reconciliation output
+This workspace retains the existing bulk file detection and reconciliation logic for:
 
-The summary table contains:
+- Nuvei EU/AE, TrustPayment, Payabl, Paysafe, Unlimit, Paystra, Axcess, and PayPal → BridgerPay
+- Dlocal, Skrill, and Paysafe Local → PayProcc
 
-- PSP and orchestrator transaction counts
-- Matched count
-- Unmatched count
-- Order mismatch
-- Amount mismatch
-- Currency mismatch
-- Route status
+## Orchestrator → Backend API workspace
 
-Timestamp differences remain available as audit evidence but are not counted as reconciliation mismatches.
+Upload the Backend API report together with available orchestrator reports:
+
+- BridgerPay
+- PayProcc
+- Coinsbuy
+- Confirmo
+- ZEN
+
+Backend business dates use **`Created At` converted from UTC+3 to GMT+6**. `Updated At` remains available for audit evidence but does not determine the daily population.
+
+The backend workspace has individual tabs for each orchestrator, plus separate Overview, Exceptions, File Audit, and Logic Reference tabs.
+
+## Backend-specific safeguards
+
+- Coinsbuy deposits above 2,500 without a Tracking ID are excluded as internal transfers.
+- ZEN includes only Apple Pay and Google Pay purchases. Plain card traffic remains under BridgerPay.
+- The target orchestrator report is matched against the complete supplied backend file to avoid false next-day missing records.
+- Backend rows created on the selected date but absent from a single-day orchestrator report are classified as adjacent-report checks.
