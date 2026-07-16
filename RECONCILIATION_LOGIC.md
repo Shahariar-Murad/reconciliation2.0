@@ -30,4 +30,5 @@ All selected dates are evaluated in **GMT+6 (Asia/Dhaka)**.
 - **Unmatched:** PSP-only plus orchestrator-only transaction keys.
 - **Order Mismatch:** a matched primary key has a mismatch in an additional order/reference field.
 - **Amount Mismatch:** the PSP and orchestrator amounts differ beyond the selected tolerance.
+- **Currency Mismatch:** the PSP and orchestrator transaction currencies differ after trimming and upper-case normalization.
 - Timestamp differences remain visible in detailed evidence but are not counted as mismatches.

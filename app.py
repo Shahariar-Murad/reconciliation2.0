@@ -13,6 +13,21 @@ from reconciliation_engine import (
     summary_dataframe,
 )
 
+APP_SCHEMA_VERSION = "2.2"
+
+# Clear only generated results when the dashboard structure changes. Uploaded
+# files remain available in Streamlit's uploader widgets, while stale summary
+# dictionaries cannot trigger KeyError after a deployment update.
+if st.session_state.get("_app_schema_version") != APP_SCHEMA_VERSION:
+    for state_key in (
+        "recon_results",
+        "file_audit",
+        "recon_signature",
+        "recon_date",
+    ):
+        st.session_state.pop(state_key, None)
+    st.session_state["_app_schema_version"] = APP_SCHEMA_VERSION
+
 st.set_page_config(
     page_title="Payment Reconciliation Dashboard",
     page_icon="🔄",
@@ -194,6 +209,7 @@ summary_table_columns = [
     "Unmatched",
     "Order Mismatch",
     "Amount Mismatch",
+    "Currency Mismatch",
     "Status",
 ]
 summary_table_available = [c for c in summary_table_columns if c in summary.columns]
@@ -201,6 +217,7 @@ summary_table = summary.sort_values(["Orchestrator", "PSP"])[summary_table_avail
 st.dataframe(summary_table, use_container_width=True, hide_index=True)
 st.caption(
     "Unmatched = PSP-only + orchestrator-only transactions. "
+    "Order, amount, and currency mismatches are counted separately. "
     "Timestamp differences are shown only as audit evidence and are not counted as mismatches."
 )
 
@@ -269,6 +286,21 @@ def status_badge(status: str) -> str:
     return f'<span class="{cls}">{status}</span>'
 
 
+def summary_metric(result, key: str) -> int:
+    """Read both current and legacy summary dictionaries safely."""
+    data = result.summary or {}
+    if key == "Unmatched":
+        value = data.get(key)
+        if value is None:
+            value = (data.get("PSP Only", 0) or 0) + (data.get("Orchestrator Only", 0) or 0)
+    else:
+        value = data.get(key, 0)
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def render_orchestrator(orchestrator: str):
     selected = [r for r in results if r.orchestrator == orchestrator]
     if not selected:
@@ -277,13 +309,14 @@ def render_orchestrator(orchestrator: str):
     for result in selected:
         with st.expander(f"{result.psp} — {result.status}", expanded=result.status != "FULL MATCH"):
             st.markdown(status_badge(result.status), unsafe_allow_html=True)
-            cols = st.columns(6)
-            cols[0].metric("PSP", f"{result.summary['PSP Count']:,}")
-            cols[1].metric("Orchestrator", f"{result.summary['Orchestrator Count']:,}")
-            cols[2].metric("Matched", f"{result.summary['Matched']:,}")
-            cols[3].metric("Unmatched", f"{result.summary['Unmatched']:,}")
-            cols[4].metric("Order mismatch", f"{result.summary['Order Mismatch']:,}")
-            cols[5].metric("Amount mismatch", f"{result.summary['Amount Mismatch']:,}")
+            cols = st.columns(7)
+            cols[0].metric("PSP", f"{summary_metric(result, 'PSP Count'):,}")
+            cols[1].metric("Orchestrator", f"{summary_metric(result, 'Orchestrator Count'):,}")
+            cols[2].metric("Matched", f"{summary_metric(result, 'Matched'):,}")
+            cols[3].metric("Unmatched", f"{summary_metric(result, 'Unmatched'):,}")
+            cols[4].metric("Order mismatch", f"{summary_metric(result, 'Order Mismatch'):,}")
+            cols[5].metric("Amount mismatch", f"{summary_metric(result, 'Amount Mismatch'):,}")
+            cols[6].metric("Currency mismatch", f"{summary_metric(result, 'Currency Mismatch'):,}")
 
             if result.notes:
                 st.caption(" • ".join(result.notes))

@@ -28,7 +28,7 @@ A Streamlit dashboard for reconciling approved PSP transactions against BridgerP
 - GMT+6 conversion and date filtering
 - PSP-specific approval rules
 - Order/reference, amount and currency validation
-- Route-level summary table with matched, unmatched, order-mismatch and amount-mismatch counts
+- Route-level summary table with matched, unmatched, order-mismatch, amount-mismatch and currency-mismatch counts
 - GMT+6 timestamps retained as audit evidence without creating time-mismatch exceptions
 - Duplicate/blank matching-key detection
 - Consolidated summary and exception review
@@ -77,3 +77,9 @@ No secrets or database configuration are required.
 ## Privacy
 
 The app does not intentionally persist uploaded files. Streamlit Community Cloud may keep session data temporarily while the session is active; follow your organization's data-handling policy before uploading sensitive production reports.
+
+## Version 2.2 fix
+
+- Prevents `KeyError: Unmatched` after redeployment by clearing incompatible generated session results and safely normalizing legacy summary dictionaries.
+- Currency mismatch is displayed in the main summary table and in each route's KPI cards.
+- Timestamp differences remain audit-only and do not affect mismatch counts or route status.

@@ -909,16 +909,54 @@ def run_all_reconciliations(
 
 
 def summary_dataframe(results: list[ReconciliationResult]) -> pd.DataFrame:
+    """Return a stable summary schema, including legacy session results.
+
+    Streamlit may retain result objects in session state across code updates.
+    Defaults here prevent missing newly introduced fields from breaking either
+    the dashboard or the consolidated Excel export.
+    """
     rows = []
     for r in results:
+        values = dict(r.summary or {})
+        psp_only = int(values.get("PSP Only", 0) or 0)
+        orch_only = int(values.get("Orchestrator Only", 0) or 0)
+        values.setdefault("PSP Count", 0)
+        values.setdefault("Orchestrator Count", 0)
+        values.setdefault("Matched", values.get("Clean Match", 0) or 0)
+        values.setdefault("Unmatched", psp_only + orch_only)
+        values.setdefault("Order Mismatch", 0)
+        values.setdefault("Amount Mismatch", 0)
+        values.setdefault("Currency Mismatch", 0)
         row = {
             "Orchestrator": r.orchestrator,
             "PSP": r.psp,
             "Status": r.status,
-            **r.summary,
+            **values,
         }
         rows.append(row)
-    return pd.DataFrame(rows)
+
+    columns = [
+        "Orchestrator",
+        "PSP",
+        "Status",
+        "PSP Count",
+        "Orchestrator Count",
+        "Matched",
+        "Unmatched",
+        "PSP Only",
+        "Orchestrator Only",
+        "Order Mismatch",
+        "Amount Mismatch",
+        "Currency Mismatch",
+    ]
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=columns)
+    for column in columns:
+        if column not in frame.columns:
+            frame[column] = 0 if column not in {"Orchestrator", "PSP", "Status"} else ""
+    remaining = [column for column in frame.columns if column not in columns]
+    return frame[columns + remaining]
 
 
 def exceptions_dataframe(results: list[ReconciliationResult]) -> pd.DataFrame:
