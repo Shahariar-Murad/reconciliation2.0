@@ -6,15 +6,42 @@ import hashlib
 import pandas as pd
 import streamlit as st
 
-from reconciliation_engine import (
-    auto_assign_uploaded_files,
-    build_excel_report,
-    exceptions_dataframe,
-    run_all_reconciliations,
-    summary_dataframe,
+# Set the page before any visible Streamlit output, including deployment errors.
+st.set_page_config(
+    page_title="Payment Reconciliation Dashboard",
+    page_icon="🔄",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-APP_SCHEMA_VERSION = "2.3"
+# Version-specific engine filename prevents Streamlit Cloud from loading an old
+# reconciliation_engine.py left in the repository from a previous release.
+try:
+    from reconciliation_engine_v24 import (
+        ENGINE_VERSION,
+        auto_assign_uploaded_files,
+        build_excel_report,
+        exceptions_dataframe,
+        run_all_reconciliations,
+        summary_dataframe,
+    )
+except (ImportError, ModuleNotFoundError) as exc:
+    st.error(
+        "The deployment files are incomplete or from different dashboard versions. "
+        "Upload both app.py and reconciliation_engine_v24.py from the same v2.4 package, "
+        "then reboot the Streamlit app."
+    )
+    st.code(f"Import details: {type(exc).__name__}: {exc}")
+    st.stop()
+
+APP_SCHEMA_VERSION = "2.4"
+EXPECTED_ENGINE_VERSION = "2.4"
+if ENGINE_VERSION != EXPECTED_ENGINE_VERSION:
+    st.error(
+        f"Dashboard/engine version mismatch: app {APP_SCHEMA_VERSION}, engine {ENGINE_VERSION}. "
+        "Replace both files from the same package and reboot the app."
+    )
+    st.stop()
 
 # Clear only generated results when the dashboard structure changes. Uploaded
 # files remain available in Streamlit's uploader widgets, while stale summary
@@ -30,13 +57,6 @@ if st.session_state.get("_app_schema_version") != APP_SCHEMA_VERSION:
     ):
         st.session_state.pop(state_key, None)
     st.session_state["_app_schema_version"] = APP_SCHEMA_VERSION
-
-st.set_page_config(
-    page_title="Payment Reconciliation Dashboard",
-    page_icon="🔄",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
 
 st.markdown(
     """
