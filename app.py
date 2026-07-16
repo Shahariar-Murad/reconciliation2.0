@@ -183,6 +183,27 @@ kpis[2].metric("Review required", review)
 kpis[3].metric("Matched transactions", f"{matched_total:,}")
 kpis[4].metric("Exception rows", f"{exception_count:,}")
 
+# Prominent route-level summary requested for daily review.
+st.subheader("PSP and orchestrator match summary")
+summary_table_columns = [
+    "PSP",
+    "Orchestrator",
+    "PSP Count",
+    "Orchestrator Count",
+    "Matched",
+    "Unmatched",
+    "Order Mismatch",
+    "Amount Mismatch",
+    "Status",
+]
+summary_table_available = [c for c in summary_table_columns if c in summary.columns]
+summary_table = summary.sort_values(["Orchestrator", "PSP"])[summary_table_available]
+st.dataframe(summary_table, use_container_width=True, hide_index=True)
+st.caption(
+    "Unmatched = PSP-only + orchestrator-only transactions. "
+    "Timestamp differences are shown only as audit evidence and are not counted as mismatches."
+)
+
 # Downloads.
 report_bytes = build_excel_report(results, file_audit, st.session_state.get("recon_date", selected_date))
 download_cols = st.columns([1, 1, 2])
@@ -219,7 +240,7 @@ with overview_tab:
     st.subheader("Reconciliation overview")
     columns = [
         "Orchestrator", "PSP", "Status", "PSP Count", "Orchestrator Count", "Matched",
-        "PSP Only", "Orchestrator Only", "Amount Mismatch", "Currency Mismatch", "Time Mismatch", "ID Mismatch",
+        "Unmatched", "PSP Only", "Orchestrator Only", "Order Mismatch", "Amount Mismatch", "Currency Mismatch",
     ]
     available = [c for c in columns if c in summary_display.columns]
     st.dataframe(summary_display[available], use_container_width=True, hide_index=True)
@@ -260,8 +281,8 @@ def render_orchestrator(orchestrator: str):
             cols[0].metric("PSP", f"{result.summary['PSP Count']:,}")
             cols[1].metric("Orchestrator", f"{result.summary['Orchestrator Count']:,}")
             cols[2].metric("Matched", f"{result.summary['Matched']:,}")
-            cols[3].metric("PSP only", f"{result.summary['PSP Only']:,}")
-            cols[4].metric("Orch only", f"{result.summary['Orchestrator Only']:,}")
+            cols[3].metric("Unmatched", f"{result.summary['Unmatched']:,}")
+            cols[4].metric("Order mismatch", f"{result.summary['Order Mismatch']:,}")
             cols[5].metric("Amount mismatch", f"{result.summary['Amount Mismatch']:,}")
 
             if result.notes:
@@ -321,7 +342,7 @@ with logic_tab:
             "Status": result.status,
             "Notes": " | ".join(result.notes),
             "Amount tolerance": result.audit.get("Amount tolerance"),
-            "Time tolerance (sec)": result.audit.get("Time tolerance seconds"),
+            "Timestamp handling": result.audit.get("Timestamp comparison"),
         })
     st.dataframe(pd.DataFrame(logic_rows), use_container_width=True, hide_index=True)
     st.markdown(
@@ -329,7 +350,7 @@ with logic_tab:
 **Operational safeguards included**
 
 - Only approved/successful payment records are reconciled; fee, refund, reversal, RG and CF lifecycle rows are excluded according to each PSP rule.
-- Every source is converted or interpreted in GMT+6 before the selected date is applied.
+- Every source is converted or interpreted in GMT+6 before the selected date is applied. Timestamps remain visible for audit evidence but do not create mismatch counts.
 - Duplicate or blank matching keys are isolated as exceptions instead of producing duplicate joins.
 - Paysafe routing is split automatically: `BP_` merchant IDs go to BridgerPay; non-`BP_` IDs go to PayProcc.
 - Dlocal amount variances are reported separately, so reference reconciliation is not confused with FX/gross-amount differences.

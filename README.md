@@ -27,7 +27,9 @@ A Streamlit dashboard for reconciling approved PSP transactions against BridgerP
 - Guided upload slots for every source file
 - GMT+6 conversion and date filtering
 - PSP-specific approval rules
-- ID, amount, currency and timestamp validation
+- Order/reference, amount and currency validation
+- Route-level summary table with matched, unmatched, order-mismatch and amount-mismatch counts
+- GMT+6 timestamps retained as audit evidence without creating time-mismatch exceptions
 - Duplicate/blank matching-key detection
 - Consolidated summary and exception review
 - Downloadable Excel evidence pack and exception CSV

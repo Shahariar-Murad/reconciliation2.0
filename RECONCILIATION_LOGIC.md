@@ -19,7 +19,15 @@ All selected dates are evaluated in **GMT+6 (Asia/Dhaka)**.
 
 ## Status definitions
 
-- **FULL MATCH:** no missing transactions and all configured ID, amount, currency and time checks pass.
+- **FULL MATCH:** no one-sided transactions and all configured order/reference, amount and currency checks pass.
 - **MATCHED WITH AMOUNT VARIANCES:** all transaction references exist on both sides, but Dlocal amount differences are present.
 - **REVIEW REQUIRED:** one-sided transactions or other mismatches are present.
 - **NO APPROVED DATA:** neither side contains approved transactions for that route/date.
+
+## Dashboard counts
+
+- **Matched:** the primary PSP and orchestrator transaction keys exist on both sides.
+- **Unmatched:** PSP-only plus orchestrator-only transaction keys.
+- **Order Mismatch:** a matched primary key has a mismatch in an additional order/reference field.
+- **Amount Mismatch:** the PSP and orchestrator amounts differ beyond the selected tolerance.
+- Timestamp differences remain visible in detailed evidence but are not counted as mismatches.

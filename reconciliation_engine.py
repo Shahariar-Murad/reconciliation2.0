@@ -406,6 +406,7 @@ def reconcile_frames(
     merged["Currency Check"] = np.where(~both, "MISSING", np.where(psp_cur.eq(orch_cur), "MATCH", "MISMATCH"))
 
     check_columns = ["Amount Check", "Currency Check"]
+    order_check_columns: list[str] = []
     for psp_col, orch_col, label in secondary_checks:
         left_col = f"PSP {psp_col}"
         right_col = f"ORCH {orch_col}"
@@ -414,14 +415,15 @@ def reconcile_frames(
         check_name = f"{label} Check"
         merged[check_name] = np.where(~both, "MISSING", np.where(left_val.eq(right_val), "MATCH", "MISMATCH"))
         check_columns.append(check_name)
+        order_check_columns.append(check_name)
 
     if time_tolerance_seconds is not None and psp_time_out in merged and orch_time_out in merged:
         psp_dt = pd.to_datetime(merged[psp_time_out], errors="coerce")
         orch_dt = pd.to_datetime(merged[orch_time_out], errors="coerce")
-        seconds = (orch_dt - psp_dt).dt.total_seconds().abs()
         merged["Time Difference (sec)"] = (orch_dt - psp_dt).dt.total_seconds()
-        merged["Time Check"] = np.where(~both, "MISSING", np.where(seconds <= time_tolerance_seconds, "MATCH", "MISMATCH"))
-        check_columns.append("Time Check")
+        # Timestamps are retained as audit evidence only. They do not affect
+        # match status or exception counts because the operational review is
+        # based on order/reference and amount reconciliation.
 
     all_checks_match = pd.Series(True, index=merged.index)
     for col in check_columns:
@@ -476,12 +478,19 @@ def reconcile_frames(
     clean_matches = int((merged["Match Status"] == "MATCH").sum())
     amount_mismatch = int((merged["Amount Check"] == "MISMATCH").sum())
     currency_mismatch = int((merged["Currency Check"] == "MISMATCH").sum())
-    time_mismatch = int((merged.get("Time Check", pd.Series(dtype=object)) == "MISMATCH").sum()) if "Time Check" in merged else 0
-    secondary_mismatches = sum(int((merged[c] == "MISMATCH").sum()) for c in check_columns if c not in ["Amount Check", "Currency Check", "Time Check"])
+    if order_check_columns:
+        order_mismatch_mask = pd.concat(
+            [merged[col].eq("MISMATCH") for col in order_check_columns],
+            axis=1,
+        ).any(axis=1)
+        order_mismatches = int(order_mismatch_mask.sum())
+    else:
+        order_mismatches = 0
+    unmatched = psp_only + orch_only
 
     if len(psp_unique) == 0 and len(orch_unique) == 0:
         status = "NO APPROVED DATA"
-    elif psp_only == 0 and orch_only == 0 and currency_mismatch == 0 and time_mismatch == 0 and secondary_mismatches == 0:
+    elif psp_only == 0 and orch_only == 0 and currency_mismatch == 0 and order_mismatches == 0:
         if amount_mismatch == 0:
             status = "FULL MATCH"
         elif amount_variances_allowed:
@@ -502,13 +511,13 @@ def reconcile_frames(
         "PSP Count": int(len(psp_unique)),
         "Orchestrator Count": int(len(orch_unique)),
         "Matched": key_matched,
+        "Unmatched": unmatched,
         "Clean Match": clean_matches,
         "PSP Only": psp_only,
         "Orchestrator Only": orch_only,
+        "Order Mismatch": order_mismatches,
         "Amount Mismatch": amount_mismatch,
         "Currency Mismatch": currency_mismatch,
-        "Time Mismatch": time_mismatch,
-        "ID Mismatch": secondary_mismatches,
         "PSP Duplicate/Blank Keys": int(len(psp_duplicates)),
         "Orchestrator Duplicate/Blank Keys": int(len(orch_duplicates)),
         "Amount Difference Total": float(pd.to_numeric(merged["Amount Difference"], errors="coerce").fillna(0).sum()),
@@ -523,7 +532,7 @@ def reconcile_frames(
         "PSP duplicate/blank-key rows": len(psp_duplicates),
         "Orchestrator duplicate/blank-key rows": len(orch_duplicates),
         "Amount tolerance": amount_tolerance,
-        "Time tolerance seconds": time_tolerance_seconds,
+        "Timestamp comparison": "Informational only; not counted as a mismatch",
     }
 
     return ReconciliationResult(
