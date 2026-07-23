@@ -14,33 +14,34 @@ st.set_page_config(
 )
 
 try:
-    from reconciliation_engine_v26 import (
+    from reconciliation_engine_v27 import (
         ENGINE_VERSION,
         auto_assign_backend_uploaded_files_range,
-        auto_assign_uploaded_files,
+        auto_assign_uploaded_files_range,
         backend_exceptions_dataframe,
         backend_range_exceptions_dataframe,
         backend_range_summary_dataframe,
         backend_summary_dataframe,
-        build_backend_excel_report,
         build_backend_range_excel_report,
-        build_excel_report,
+        build_psp_range_excel_report,
         exceptions_dataframe,
-        run_all_reconciliations,
+        psp_range_exceptions_dataframe,
+        psp_range_summary_dataframe,
         run_backend_reconciliation_range,
+        run_psp_reconciliation_range,
         summary_dataframe,
     )
 except (ImportError, ModuleNotFoundError) as exc:
     st.error(
         "The deployment files are incomplete or from different dashboard versions. "
-        "Upload both app.py and reconciliation_engine_v26.py from the same v2.6 package, "
+        "Upload both app.py and reconciliation_engine_v27.py from the same v2.7 package, "
         "then reboot the Streamlit app."
     )
     st.code(f"Import details: {type(exc).__name__}: {exc}")
     st.stop()
 
-APP_SCHEMA_VERSION = "2.6"
-EXPECTED_ENGINE_VERSION = "2.6"
+APP_SCHEMA_VERSION = "2.7"
+EXPECTED_ENGINE_VERSION = "2.7"
 if ENGINE_VERSION != EXPECTED_ENGINE_VERSION:
     st.error(
         f"Dashboard/engine version mismatch: app {APP_SCHEMA_VERSION}, engine {ENGINE_VERSION}. "
@@ -83,31 +84,37 @@ st.markdown(
 
 with st.sidebar:
     st.header("Global settings")
-    psp_selected_date = st.date_input(
-        "PSP reconciliation date (GMT+6)",
-        value=date.today() - timedelta(days=1),
-        key="psp_date_input",
+    reconciliation_date_value = st.date_input(
+        "Reconciliation date or date range (GMT+6)",
+        value=(date.today() - timedelta(days=1), date.today() - timedelta(days=1)),
+        key="reconciliation_date_range_input",
+        help=(
+            "For a single day, select one date (or the same start and end date). "
+            "For multiple days, select the first and last date, for example 17 July to 22 July. "
+            "The same selection is applied to both reconciliation stages."
+        ),
     )
-    backend_date_value = st.date_input(
-        "Backend reconciliation date range (GMT+6)",
-        value=(date.today() - timedelta(days=5), date.today() - timedelta(days=1)),
-        key="backend_date_range_input",
-        help="Select a start date and an end date. Each date is reconciled independently.",
-    )
-    if isinstance(backend_date_value, (tuple, list)):
-        if len(backend_date_value) == 2:
-            backend_start_date, backend_end_date = backend_date_value
-        elif len(backend_date_value) == 1:
-            backend_start_date = backend_end_date = backend_date_value[0]
+    if isinstance(reconciliation_date_value, (tuple, list)):
+        if len(reconciliation_date_value) == 2:
+            reconciliation_start_date, reconciliation_end_date = reconciliation_date_value
+        elif len(reconciliation_date_value) == 1:
+            reconciliation_start_date = reconciliation_end_date = reconciliation_date_value[0]
         else:
-            backend_start_date = backend_end_date = date.today() - timedelta(days=1)
+            reconciliation_start_date = reconciliation_end_date = date.today() - timedelta(days=1)
     else:
-        backend_start_date = backend_end_date = backend_date_value
-    if backend_end_date < backend_start_date:
-        backend_start_date, backend_end_date = backend_end_date, backend_start_date
-    backend_range_days = (backend_end_date - backend_start_date).days + 1
-    if backend_range_days > 31:
-        st.error("Select a backend reconciliation range of 31 days or fewer.")
+        reconciliation_start_date = reconciliation_end_date = reconciliation_date_value
+    if reconciliation_end_date < reconciliation_start_date:
+        reconciliation_start_date, reconciliation_end_date = reconciliation_end_date, reconciliation_start_date
+    reconciliation_range_days = (reconciliation_end_date - reconciliation_start_date).days + 1
+    if reconciliation_range_days > 31:
+        st.error("Select a reconciliation range of 31 days or fewer.")
+    elif reconciliation_start_date == reconciliation_end_date:
+        st.caption(f"Selected: {reconciliation_start_date:%d %b %Y} (single day)")
+    else:
+        st.caption(
+            f"Selected: {reconciliation_start_date:%d %b %Y} to "
+            f"{reconciliation_end_date:%d %b %Y} ({reconciliation_range_days} days)"
+        )
     amount_tolerance = st.number_input(
         "Amount tolerance",
         min_value=0.0,
@@ -120,7 +127,6 @@ with st.sidebar:
     st.markdown("**Backend business-date rule**")
     st.caption("Backend `Created At` is converted from UTC+3 to GMT+6. `Updated At` is audit-only.")
     st.caption("Uploaded files and generated results remain only in the current Streamlit session.")
-
 
 def files_signature(files, workspace: str, date_setting) -> str:
     digest = hashlib.sha256()
@@ -173,7 +179,10 @@ def render_mapping(mapping: list[dict], *, title: str = "Auto-detected file mapp
 
 def render_psp_workspace() -> None:
     st.markdown('<div class="flow-title">PSP → Orchestrator</div>', unsafe_allow_html=True)
-    st.caption("Existing PSP reconciliation workspace. Upload PSP reports together with BridgerPay and PayProcc reports.")
+    st.caption(
+        "Upload PSP reports together with BridgerPay and PayProcc reports. "
+        "The shared GMT+6 date selection can be one day or a multi-day range."
+    )
 
     upload_col, run_col = st.columns([4, 1])
     with upload_col:
@@ -195,7 +204,9 @@ def render_psp_workspace() -> None:
         )
 
     uploaded = len(files or [])
-    current_signature = files_signature(files, "psp", psp_selected_date)
+    current_signature = files_signature(
+        files, "psp", (reconciliation_start_date, reconciliation_end_date)
+    )
 
     if files:
         with st.expander(f"Selected PSP-stage files ({uploaded})", expanded=False):
@@ -205,39 +216,93 @@ def render_psp_workspace() -> None:
     if run_clicked:
         if not files:
             st.warning("Upload at least one orchestrator file and its related PSP report.")
+        elif reconciliation_range_days > 31:
+            st.error("Reduce the reconciliation range to 31 days or fewer.")
         else:
-            with st.spinner("Detecting reports, applying GMT+6 rules, and reconciling PSP transactions…"):
-                assigned, mapping = auto_assign_uploaded_files(files, psp_selected_date)
-                results, audit = run_all_reconciliations(assigned, psp_selected_date, amount_tolerance)
-                st.session_state["psp_results"] = results
-                st.session_state["psp_audit"] = audit
+            with st.spinner(
+                f"Reconciling each GMT+6 date from {reconciliation_start_date:%d %b %Y} "
+                f"to {reconciliation_end_date:%d %b %Y}…"
+            ):
+                assigned, mapping = auto_assign_uploaded_files_range(
+                    files, reconciliation_start_date, reconciliation_end_date
+                )
+                results_by_date, audit_by_date = run_psp_reconciliation_range(
+                    assigned,
+                    reconciliation_start_date,
+                    reconciliation_end_date,
+                    amount_tolerance,
+                )
+                report_bytes = build_psp_range_excel_report(
+                    results_by_date,
+                    audit_by_date,
+                    reconciliation_start_date,
+                    reconciliation_end_date,
+                    mapping,
+                )
+                range_exceptions = psp_range_exceptions_dataframe(results_by_date)
+                exception_csv = (
+                    range_exceptions.to_csv(index=False).encode("utf-8-sig")
+                    if not range_exceptions.empty
+                    else b"No exceptions found.\n"
+                )
+                st.session_state["psp_results_by_date"] = results_by_date
+                st.session_state["psp_audit_by_date"] = audit_by_date
                 st.session_state["psp_mapping"] = mapping
+                st.session_state["psp_report_bytes"] = report_bytes
+                st.session_state["psp_exception_csv"] = exception_csv
                 st.session_state["psp_signature"] = current_signature
-                st.session_state["psp_date"] = psp_selected_date
+                st.session_state["psp_date_range"] = (
+                    reconciliation_start_date,
+                    reconciliation_end_date,
+                )
 
-    results = st.session_state.get("psp_results", [])
-    audit = st.session_state.get("psp_audit", [])
+    results_by_date = st.session_state.get("psp_results_by_date", {})
+    audit_by_date = st.session_state.get("psp_audit_by_date", {})
     mapping = st.session_state.get("psp_mapping", [])
     is_current = st.session_state.get("psp_signature") == current_signature
 
-    if results and not is_current:
-        st.info("The PSP-stage files or settings changed. Click **Run PSP reconciliation** to refresh.")
+    if results_by_date and not is_current:
+        st.warning(
+            "The PSP files, shared date range, or tolerance changed. The previous figures are hidden. "
+            "Click **Run PSP reconciliation**."
+        )
+        results_by_date = {}
+        audit_by_date = {}
+        mapping = []
 
     render_mapping(mapping)
 
-    summary = summary_dataframe(results)
-    exceptions = exceptions_dataframe(results)
+    summary = psp_range_summary_dataframe(results_by_date)
+    exceptions = psp_range_exceptions_dataframe(results_by_date)
+    summary_display = summary.copy()
+    if "Reconciliation Date GMT+6" in summary_display.columns and not summary_display.empty:
+        summary_display["Reconciliation Date GMT+6"] = pd.to_datetime(
+            summary_display["Reconciliation Date GMT+6"], errors="coerce"
+        ).dt.strftime("%d-%b-%Y")
 
     metric_cols = st.columns(6)
     metric_cols[0].metric("Files uploaded", uploaded)
     metric_cols[1].metric("Recognized files", recognized_count(mapping))
-    metric_cols[2].metric("Routes processed", len(summary))
-    metric_cols[3].metric("Full match", int(summary["Status"].eq("FULL MATCH").sum()) if not summary.empty else 0)
-    metric_cols[4].metric("Review required", int(summary["Status"].eq("REVIEW REQUIRED").sum()) if not summary.empty else 0)
-    metric_cols[5].metric("Matched transactions", f"{int(summary['Matched'].sum()) if 'Matched' in summary else 0:,}")
+    metric_cols[2].metric("Route-days processed", len(summary))
+    metric_cols[3].metric(
+        "Full match",
+        int(summary["Status"].eq("FULL MATCH").sum()) if not summary.empty else 0,
+    )
+    metric_cols[4].metric(
+        "Review required",
+        int(summary["Status"].isin(["REVIEW REQUIRED", "MATCHED WITH AMOUNT VARIANCES"]).sum())
+        if not summary.empty else 0,
+    )
+    metric_cols[5].metric(
+        "Matched transactions",
+        f"{int(summary['Matched'].sum()) if 'Matched' in summary else 0:,}",
+    )
 
-    if not results:
-        st.info("Upload the PSP-stage files and run the reconciliation. Only routes with both required sides are processed.")
+    if not any(results_by_date.values()):
+        st.info(
+            "Upload the PSP-stage files, select one date or a date range from Global settings, "
+            "and run the reconciliation."
+        )
         st.subheader("Configured PSP-stage routes")
         preview = pd.DataFrame(
             [
@@ -259,35 +324,67 @@ def render_psp_workspace() -> None:
 
     st.subheader("PSP and orchestrator match summary")
     columns = [
-        "PSP", "Orchestrator", "PSP Count", "Orchestrator Count", "Matched", "Unmatched",
-        "Order Mismatch", "Amount Mismatch", "Currency Mismatch", "Status",
+        "Reconciliation Date GMT+6", "PSP", "Orchestrator", "PSP Count",
+        "Orchestrator Count", "Matched", "Unmatched", "PSP Only",
+        "Orchestrator Only", "Order Mismatch", "Amount Mismatch",
+        "Currency Mismatch", "Status",
     ]
-    available = [column for column in columns if column in summary.columns]
-    st.dataframe(summary.sort_values(["Orchestrator", "PSP"])[available], use_container_width=True, hide_index=True)
-    st.caption("Timestamp differences remain audit-only. Order, amount, and currency checks are counted separately.")
+    available = [column for column in columns if column in summary_display.columns]
+    st.dataframe(
+        summary_display.sort_values(["Reconciliation Date GMT+6", "Orchestrator", "PSP"])[available],
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption(
+        "Every selected date is reconciled independently. The table above contains all dates in the shared range."
+    )
 
-    report_bytes = build_excel_report(results, audit, st.session_state.get("psp_date", psp_selected_date), mapping)
+    stored_start, stored_end = st.session_state.get(
+        "psp_date_range", (reconciliation_start_date, reconciliation_end_date)
+    )
+    report_bytes = st.session_state.get("psp_report_bytes", b"")
+    exception_csv = st.session_state.get("psp_exception_csv", b"No exceptions found.\n")
     download_cols = st.columns([1, 1, 2])
     download_cols[0].download_button(
         "Download PSP-stage Excel",
         data=report_bytes,
-        file_name=f"psp_to_orchestrator_{psp_selected_date.isoformat()}_GMT6.xlsx",
+        file_name=f"psp_to_orchestrator_{stored_start.isoformat()}_to_{stored_end.isoformat()}_GMT6.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
     download_cols[1].download_button(
         "Download exceptions CSV",
         data=exception_csv,
-        file_name=f"psp_to_orchestrator_exceptions_{psp_selected_date.isoformat()}_GMT6.csv",
+        file_name=f"psp_to_orchestrator_exceptions_{stored_start.isoformat()}_to_{stored_end.isoformat()}_GMT6.csv",
         mime="text/csv",
         use_container_width=True,
     )
-    download_cols[2].caption("The Excel file includes summary, upload mapping, file audit, exceptions, and route details.")
+    download_cols[2].caption("One evidence workbook contains all selected dates and route details.")
 
-    status_order = {"REVIEW REQUIRED": 0, "MATCHED WITH AMOUNT VARIANCES": 1, "FULL MATCH": 2, "NO APPROVED DATA": 3}
-    display = summary.copy()
+    available_dates = sorted(results_by_date)
+    detail_date = st.selectbox(
+        "Detailed reconciliation date (GMT+6)",
+        options=available_dates,
+        index=len(available_dates) - 1,
+        format_func=lambda value: value.strftime("%d %b %Y"),
+        key="psp_detail_date",
+        help="The summary shows the full range. Route tabs below show this selected date only.",
+    )
+    results = results_by_date.get(detail_date, [])
+    audit = audit_by_date.get(detail_date, [])
+    daily_exceptions = exceptions_dataframe(results)
+
+    status_order = {
+        "REVIEW REQUIRED": 0,
+        "MATCHED WITH AMOUNT VARIANCES": 1,
+        "FULL MATCH": 2,
+        "NO APPROVED DATA": 3,
+    }
+    display = summary_display.copy()
     display["_order"] = display["Status"].map(status_order).fillna(9)
-    display = display.sort_values(["_order", "Orchestrator", "PSP"]).drop(columns="_order")
+    display = display.sort_values(
+        ["Reconciliation Date GMT+6", "_order", "Orchestrator", "PSP"]
+    ).drop(columns="_order")
 
     overview_tab, bp_tab, pp_tab, exception_tab, audit_tab, logic_tab = st.tabs(
         ["Overview", "BridgerPay", "PayProcc", "Exceptions", "File audit", "Logic reference"]
@@ -295,21 +392,32 @@ def render_psp_workspace() -> None:
 
     with overview_tab:
         overview_columns = [
-            "Orchestrator", "PSP", "Status", "PSP Count", "Orchestrator Count", "Matched",
-            "Unmatched", "PSP Only", "Orchestrator Only", "Order Mismatch", "Amount Mismatch", "Currency Mismatch",
+            "Reconciliation Date GMT+6", "Orchestrator", "PSP", "Status", "PSP Count",
+            "Orchestrator Count", "Matched", "Unmatched", "PSP Only", "Orchestrator Only",
+            "Order Mismatch", "Amount Mismatch", "Currency Mismatch",
         ]
-        st.dataframe(display[[c for c in overview_columns if c in display.columns]], use_container_width=True, hide_index=True)
-        review_df = display[display["Status"].isin(["REVIEW REQUIRED", "MATCHED WITH AMOUNT VARIANCES"])]
+        st.dataframe(
+            display[[c for c in overview_columns if c in display.columns]],
+            use_container_width=True,
+            hide_index=True,
+        )
+        review_df = display[
+            display["Status"].isin(["REVIEW REQUIRED", "MATCHED WITH AMOUNT VARIANCES"])
+        ]
         st.subheader("Priority review")
         if review_df.empty:
-            st.success("No PSP-stage routes require review.")
+            st.success("No PSP-stage routes require review in the selected range.")
         else:
-            st.dataframe(review_df[[c for c in overview_columns if c in review_df.columns]], use_container_width=True, hide_index=True)
+            st.dataframe(
+                review_df[[c for c in overview_columns if c in review_df.columns]],
+                use_container_width=True,
+                hide_index=True,
+            )
 
     def render_psp_orchestrator(orchestrator: str) -> None:
         selected = [result for result in results if result.orchestrator == orchestrator]
         if not selected:
-            st.info(f"No {orchestrator} routes were processed.")
+            st.info(f"No {orchestrator} routes were processed for {detail_date:%d %b %Y}.")
             return
         for result in selected:
             with st.expander(f"{result.psp} — {result.status}", expanded=result.status != "FULL MATCH"):
@@ -325,7 +433,9 @@ def render_psp_workspace() -> None:
                 metrics[6].metric("Currency mismatch", f"{safe_int(values.get('Currency Mismatch')):,}")
                 if result.notes:
                     st.caption(" • ".join(result.notes))
-                detail, exc, source, route_audit = st.tabs(["Reconciliation", "Exceptions", "Source rows", "Audit"])
+                detail, exc, source, route_audit = st.tabs(
+                    ["Reconciliation", "Exceptions", "Source rows", "Audit"]
+                )
                 with detail:
                     st.dataframe(result.reconciliation, use_container_width=True, hide_index=True, height=430)
                 with exc:
@@ -349,17 +459,23 @@ def render_psp_workspace() -> None:
     with pp_tab:
         render_psp_orchestrator("PayProcc")
     with exception_tab:
-        if exceptions.empty:
-            st.success("No PSP-stage exceptions found.")
+        if daily_exceptions.empty:
+            st.success(f"No PSP-stage exceptions found for {detail_date:%d %b %Y}.")
         else:
-            options = ["All"] + sorted(exceptions["Orchestrator"].dropna().unique().tolist())
-            selected_orchestrator = st.selectbox("Filter orchestrator", options, key="psp_exception_filter")
-            filtered = exceptions if selected_orchestrator == "All" else exceptions[exceptions["Orchestrator"] == selected_orchestrator]
+            options = ["All"] + sorted(daily_exceptions["Orchestrator"].dropna().unique().tolist())
+            selected_orchestrator = st.selectbox(
+                "Filter orchestrator", options, key="psp_exception_filter"
+            )
+            filtered = (
+                daily_exceptions
+                if selected_orchestrator == "All"
+                else daily_exceptions[daily_exceptions["Orchestrator"] == selected_orchestrator]
+            )
             st.dataframe(filtered, use_container_width=True, hide_index=True, height=540)
     with audit_tab:
         st.subheader("Upload mapping")
         st.dataframe(pd.DataFrame(mapping), use_container_width=True, hide_index=True)
-        st.subheader("File readiness")
+        st.subheader(f"File readiness — {detail_date:%d %b %Y}")
         st.dataframe(pd.DataFrame(audit), use_container_width=True, hide_index=True)
     with logic_tab:
         logic_rows = [{
@@ -397,7 +513,7 @@ def render_backend_workspace() -> None:
         )
 
     uploaded = len(files or [])
-    current_signature = files_signature(files, "backend", (backend_start_date, backend_end_date))
+    current_signature = files_signature(files, "backend", (reconciliation_start_date, reconciliation_end_date))
 
     if files:
         with st.expander(f"Selected backend-stage files ({uploaded})", expanded=False):
@@ -408,21 +524,21 @@ def render_backend_workspace() -> None:
         if not files:
             st.warning("Upload the Backend API report and at least one orchestrator report.")
         else:
-            if backend_range_days > 31:
-                st.error("Reduce the backend reconciliation range to 31 days or fewer.")
+            if reconciliation_range_days > 31:
+                st.error("Reduce the reconciliation range to 31 days or fewer.")
             else:
                 with st.spinner(
-                    f"Reconciling each GMT+6 date from {backend_start_date:%d %b %Y} "
-                    f"to {backend_end_date:%d %b %Y}…"
+                    f"Reconciling each GMT+6 date from {reconciliation_start_date:%d %b %Y} "
+                    f"to {reconciliation_end_date:%d %b %Y}…"
                 ):
                     assigned, mapping = auto_assign_backend_uploaded_files_range(
-                        files, backend_start_date, backend_end_date
+                        files, reconciliation_start_date, reconciliation_end_date
                     )
                     results_by_date, audit_by_date = run_backend_reconciliation_range(
-                        assigned, backend_start_date, backend_end_date, amount_tolerance
+                        assigned, reconciliation_start_date, reconciliation_end_date, amount_tolerance
                     )
                     report_bytes = build_backend_range_excel_report(
-                        results_by_date, audit_by_date, backend_start_date, backend_end_date, mapping
+                        results_by_date, audit_by_date, reconciliation_start_date, reconciliation_end_date, mapping
                     )
                     range_exceptions = backend_range_exceptions_dataframe(results_by_date)
                     exception_csv = (
@@ -436,7 +552,7 @@ def render_backend_workspace() -> None:
                     st.session_state["backend_report_bytes"] = report_bytes
                     st.session_state["backend_exception_csv"] = exception_csv
                     st.session_state["backend_signature"] = current_signature
-                    st.session_state["backend_date_range"] = (backend_start_date, backend_end_date)
+                    st.session_state["backend_date_range"] = (reconciliation_start_date, reconciliation_end_date)
 
     results_by_date = st.session_state.get("backend_results_by_date", {})
     audit_by_date = st.session_state.get("backend_audit_by_date", {})
@@ -473,7 +589,7 @@ def render_backend_workspace() -> None:
     metric_cols[5].metric("Exception rows", f"{len(exceptions):,}")
 
     if not results_by_date:
-        st.info("Upload the backend file and available orchestrator reports, select a date range, then run this workspace.")
+        st.info("Upload the backend file and available orchestrator reports, select one date or a date range, then run this workspace.")
         st.subheader("Configured backend-stage routes")
         preview = pd.DataFrame(
             [
@@ -503,7 +619,7 @@ def render_backend_workspace() -> None:
     )
 
     stored_start, stored_end = st.session_state.get(
-        "backend_date_range", (backend_start_date, backend_end_date)
+        "backend_date_range", (reconciliation_start_date, reconciliation_end_date)
     )
     report_bytes = st.session_state.get("backend_report_bytes", b"")
     exception_csv = st.session_state.get("backend_exception_csv", b"No exceptions found.\n")
