@@ -14,30 +14,33 @@ st.set_page_config(
 )
 
 try:
-    from reconciliation_engine_v25 import (
+    from reconciliation_engine_v26 import (
         ENGINE_VERSION,
-        auto_assign_backend_uploaded_files,
+        auto_assign_backend_uploaded_files_range,
         auto_assign_uploaded_files,
         backend_exceptions_dataframe,
+        backend_range_exceptions_dataframe,
+        backend_range_summary_dataframe,
         backend_summary_dataframe,
         build_backend_excel_report,
+        build_backend_range_excel_report,
         build_excel_report,
         exceptions_dataframe,
         run_all_reconciliations,
-        run_backend_reconciliations,
+        run_backend_reconciliation_range,
         summary_dataframe,
     )
 except (ImportError, ModuleNotFoundError) as exc:
     st.error(
         "The deployment files are incomplete or from different dashboard versions. "
-        "Upload both app.py and reconciliation_engine_v25.py from the same v2.5 package, "
+        "Upload both app.py and reconciliation_engine_v26.py from the same v2.6 package, "
         "then reboot the Streamlit app."
     )
     st.code(f"Import details: {type(exc).__name__}: {exc}")
     st.stop()
 
-APP_SCHEMA_VERSION = "2.5"
-EXPECTED_ENGINE_VERSION = "2.5"
+APP_SCHEMA_VERSION = "2.6"
+EXPECTED_ENGINE_VERSION = "2.6"
 if ENGINE_VERSION != EXPECTED_ENGINE_VERSION:
     st.error(
         f"Dashboard/engine version mismatch: app {APP_SCHEMA_VERSION}, engine {ENGINE_VERSION}. "
@@ -80,10 +83,31 @@ st.markdown(
 
 with st.sidebar:
     st.header("Global settings")
-    selected_date = st.date_input(
-        "Reconciliation date (GMT+6)",
+    psp_selected_date = st.date_input(
+        "PSP reconciliation date (GMT+6)",
         value=date.today() - timedelta(days=1),
+        key="psp_date_input",
     )
+    backend_date_value = st.date_input(
+        "Backend reconciliation date range (GMT+6)",
+        value=(date.today() - timedelta(days=5), date.today() - timedelta(days=1)),
+        key="backend_date_range_input",
+        help="Select a start date and an end date. Each date is reconciled independently.",
+    )
+    if isinstance(backend_date_value, (tuple, list)):
+        if len(backend_date_value) == 2:
+            backend_start_date, backend_end_date = backend_date_value
+        elif len(backend_date_value) == 1:
+            backend_start_date = backend_end_date = backend_date_value[0]
+        else:
+            backend_start_date = backend_end_date = date.today() - timedelta(days=1)
+    else:
+        backend_start_date = backend_end_date = backend_date_value
+    if backend_end_date < backend_start_date:
+        backend_start_date, backend_end_date = backend_end_date, backend_start_date
+    backend_range_days = (backend_end_date - backend_start_date).days + 1
+    if backend_range_days > 31:
+        st.error("Select a backend reconciliation range of 31 days or fewer.")
     amount_tolerance = st.number_input(
         "Amount tolerance",
         min_value=0.0,
@@ -98,10 +122,10 @@ with st.sidebar:
     st.caption("Uploaded files and generated results remain only in the current Streamlit session.")
 
 
-def files_signature(files, workspace: str) -> str:
+def files_signature(files, workspace: str, date_setting) -> str:
     digest = hashlib.sha256()
     digest.update(workspace.encode())
-    digest.update(str(selected_date).encode())
+    digest.update(str(date_setting).encode())
     digest.update(str(amount_tolerance).encode())
     for uploaded in sorted(files or [], key=lambda item: (item.name, len(item.getvalue()))):
         digest.update(uploaded.name.encode())
@@ -171,7 +195,7 @@ def render_psp_workspace() -> None:
         )
 
     uploaded = len(files or [])
-    current_signature = files_signature(files, "psp")
+    current_signature = files_signature(files, "psp", psp_selected_date)
 
     if files:
         with st.expander(f"Selected PSP-stage files ({uploaded})", expanded=False):
@@ -183,13 +207,13 @@ def render_psp_workspace() -> None:
             st.warning("Upload at least one orchestrator file and its related PSP report.")
         else:
             with st.spinner("Detecting reports, applying GMT+6 rules, and reconciling PSP transactions…"):
-                assigned, mapping = auto_assign_uploaded_files(files, selected_date)
-                results, audit = run_all_reconciliations(assigned, selected_date, amount_tolerance)
+                assigned, mapping = auto_assign_uploaded_files(files, psp_selected_date)
+                results, audit = run_all_reconciliations(assigned, psp_selected_date, amount_tolerance)
                 st.session_state["psp_results"] = results
                 st.session_state["psp_audit"] = audit
                 st.session_state["psp_mapping"] = mapping
                 st.session_state["psp_signature"] = current_signature
-                st.session_state["psp_date"] = selected_date
+                st.session_state["psp_date"] = psp_selected_date
 
     results = st.session_state.get("psp_results", [])
     audit = st.session_state.get("psp_audit", [])
@@ -242,20 +266,19 @@ def render_psp_workspace() -> None:
     st.dataframe(summary.sort_values(["Orchestrator", "PSP"])[available], use_container_width=True, hide_index=True)
     st.caption("Timestamp differences remain audit-only. Order, amount, and currency checks are counted separately.")
 
-    report_bytes = build_excel_report(results, audit, st.session_state.get("psp_date", selected_date), mapping)
+    report_bytes = build_excel_report(results, audit, st.session_state.get("psp_date", psp_selected_date), mapping)
     download_cols = st.columns([1, 1, 2])
     download_cols[0].download_button(
         "Download PSP-stage Excel",
         data=report_bytes,
-        file_name=f"psp_to_orchestrator_{selected_date.isoformat()}_GMT6.xlsx",
+        file_name=f"psp_to_orchestrator_{psp_selected_date.isoformat()}_GMT6.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
-    exception_csv = exceptions.to_csv(index=False).encode("utf-8-sig") if not exceptions.empty else b"No exceptions found.\n"
     download_cols[1].download_button(
         "Download exceptions CSV",
         data=exception_csv,
-        file_name=f"psp_to_orchestrator_exceptions_{selected_date.isoformat()}_GMT6.csv",
+        file_name=f"psp_to_orchestrator_exceptions_{psp_selected_date.isoformat()}_GMT6.csv",
         mime="text/csv",
         use_container_width=True,
     )
@@ -374,7 +397,7 @@ def render_backend_workspace() -> None:
         )
 
     uploaded = len(files or [])
-    current_signature = files_signature(files, "backend")
+    current_signature = files_signature(files, "backend", (backend_start_date, backend_end_date))
 
     if files:
         with st.expander(f"Selected backend-stage files ({uploaded})", expanded=False):
@@ -385,40 +408,72 @@ def render_backend_workspace() -> None:
         if not files:
             st.warning("Upload the Backend API report and at least one orchestrator report.")
         else:
-            with st.spinner("Detecting backend-stage reports and reconciling with Backend Created At…"):
-                assigned, mapping = auto_assign_backend_uploaded_files(files, selected_date)
-                results, audit = run_backend_reconciliations(assigned, selected_date, amount_tolerance)
-                st.session_state["backend_results"] = results
-                st.session_state["backend_audit"] = audit
-                st.session_state["backend_mapping"] = mapping
-                st.session_state["backend_signature"] = current_signature
-                st.session_state["backend_date"] = selected_date
+            if backend_range_days > 31:
+                st.error("Reduce the backend reconciliation range to 31 days or fewer.")
+            else:
+                with st.spinner(
+                    f"Reconciling each GMT+6 date from {backend_start_date:%d %b %Y} "
+                    f"to {backend_end_date:%d %b %Y}…"
+                ):
+                    assigned, mapping = auto_assign_backend_uploaded_files_range(
+                        files, backend_start_date, backend_end_date
+                    )
+                    results_by_date, audit_by_date = run_backend_reconciliation_range(
+                        assigned, backend_start_date, backend_end_date, amount_tolerance
+                    )
+                    report_bytes = build_backend_range_excel_report(
+                        results_by_date, audit_by_date, backend_start_date, backend_end_date, mapping
+                    )
+                    range_exceptions = backend_range_exceptions_dataframe(results_by_date)
+                    exception_csv = (
+                        range_exceptions.to_csv(index=False).encode("utf-8-sig")
+                        if not range_exceptions.empty
+                        else b"No exceptions found.\n"
+                    )
+                    st.session_state["backend_results_by_date"] = results_by_date
+                    st.session_state["backend_audit_by_date"] = audit_by_date
+                    st.session_state["backend_mapping"] = mapping
+                    st.session_state["backend_report_bytes"] = report_bytes
+                    st.session_state["backend_exception_csv"] = exception_csv
+                    st.session_state["backend_signature"] = current_signature
+                    st.session_state["backend_date_range"] = (backend_start_date, backend_end_date)
 
-    results = st.session_state.get("backend_results", [])
-    audit = st.session_state.get("backend_audit", [])
+    results_by_date = st.session_state.get("backend_results_by_date", {})
+    audit_by_date = st.session_state.get("backend_audit_by_date", {})
     mapping = st.session_state.get("backend_mapping", [])
     is_current = st.session_state.get("backend_signature") == current_signature
 
-    if results and not is_current:
-        st.info("The backend-stage files or settings changed. Click **Run backend reconciliation** to refresh.")
+    if results_by_date and not is_current:
+        st.warning(
+            "The backend files, date range, or tolerance changed. The previous figures are hidden to prevent "
+            "one date's results from appearing under another date. Click **Run backend reconciliation**."
+        )
+        results_by_date = {}
+        audit_by_date = {}
+        mapping = []
 
     render_mapping(mapping)
 
-    summary = backend_summary_dataframe(results)
-    exceptions = backend_exceptions_dataframe(results)
+    summary = backend_range_summary_dataframe(results_by_date)
+    exceptions = backend_range_exceptions_dataframe(results_by_date)
+    summary_display = summary.copy()
+    if "Reconciliation Date GMT+6" in summary_display.columns and not summary_display.empty:
+        summary_display["Reconciliation Date GMT+6"] = pd.to_datetime(
+            summary_display["Reconciliation Date GMT+6"], errors="coerce"
+        ).dt.strftime("%d-%b-%Y")
 
     total_orchestrator = int(summary["Orchestrator Count"].sum()) if "Orchestrator Count" in summary else 0
     total_matched = int(summary["Matched"].sum()) if "Matched" in summary else 0
     metric_cols = st.columns(6)
     metric_cols[0].metric("Files uploaded", uploaded)
     metric_cols[1].metric("Recognized files", recognized_count(mapping))
-    metric_cols[2].metric("Routes processed", len(summary))
+    metric_cols[2].metric("Route-days processed", len(summary))
     metric_cols[3].metric("Orchestrator transactions", f"{total_orchestrator:,}")
     metric_cols[4].metric("Matched", f"{total_matched:,}")
     metric_cols[5].metric("Exception rows", f"{len(exceptions):,}")
 
-    if not results:
-        st.info("Upload the backend file and available orchestrator reports, then run this workspace.")
+    if not results_by_date:
+        st.info("Upload the backend file and available orchestrator reports, select a date range, then run this workspace.")
         st.subheader("Configured backend-stage routes")
         preview = pd.DataFrame(
             [
@@ -435,24 +490,30 @@ def render_backend_workspace() -> None:
 
     st.subheader("Orchestrator and backend match summary")
     columns = [
-        "Orchestrator", "Backend Gateway", "Orchestrator Count", "Backend Created-Date Count",
+        "Reconciliation Date GMT+6", "Orchestrator", "Backend Gateway", "Orchestrator Count", "Backend Created-Date Count",
         "Matched", "Same Created Date", "Prior Backend Created Date", "Next Backend Created Date",
         "Orchestrator Only", "Backend Adjacent Matched", "Backend Adjacent Report Needed",
         "Amount Mismatch", "Amount Variance", "Tracking Mismatch", "Currency Mismatch", "Status",
     ]
     available = [column for column in columns if column in summary.columns]
-    st.dataframe(summary[available], use_container_width=True, hide_index=True)
+    st.dataframe(summary_display[available], use_container_width=True, hide_index=True)
     st.caption(
-        "The orchestrator report is the business-date anchor. Backend Created At selects backend daily rows. "
-        "Adjacent-date matches are shown separately to prevent false missing-transaction counts."
+        "Every selected date is reconciled independently. The orchestrator report is the business-date anchor; "
+        "Backend Created At selects backend daily rows. Adjacent-date matches are shown separately."
     )
 
-    report_bytes = build_backend_excel_report(results, audit, st.session_state.get("backend_date", selected_date), mapping)
+    stored_start, stored_end = st.session_state.get(
+        "backend_date_range", (backend_start_date, backend_end_date)
+    )
+    report_bytes = st.session_state.get("backend_report_bytes", b"")
+    exception_csv = st.session_state.get("backend_exception_csv", b"No exceptions found.\n")
     download_cols = st.columns([1, 1, 2])
     download_cols[0].download_button(
         "Download backend-stage Excel",
         data=report_bytes,
-        file_name=f"orchestrator_to_backend_{selected_date.isoformat()}_GMT6.xlsx",
+        file_name=(
+            f"orchestrator_to_backend_{stored_start.isoformat()}_to_{stored_end.isoformat()}_GMT6.xlsx"
+        ),
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
@@ -460,11 +521,27 @@ def render_backend_workspace() -> None:
     download_cols[1].download_button(
         "Download exceptions CSV",
         data=exception_csv,
-        file_name=f"orchestrator_to_backend_exceptions_{selected_date.isoformat()}_GMT6.csv",
+        file_name=(
+            f"orchestrator_to_backend_exceptions_{stored_start.isoformat()}_to_{stored_end.isoformat()}_GMT6.csv"
+        ),
         mime="text/csv",
         use_container_width=True,
     )
-    download_cols[2].caption("The backend-stage Excel is separate from the PSP-stage workbook to keep the evidence organized.")
+    download_cols[2].caption("The backend-stage Excel contains all selected dates in one evidence workbook.")
+
+    available_dates = sorted(results_by_date)
+    detail_date = st.selectbox(
+        "Detailed reconciliation date (GMT+6)",
+        options=available_dates,
+        index=len(available_dates) - 1,
+        format_func=lambda value: value.strftime("%d %b %Y"),
+        key="backend_detail_date",
+        help="The overview shows the full date range. Route tabs below show this selected date only.",
+    )
+    results = results_by_date.get(detail_date, [])
+    audit = audit_by_date.get(detail_date, [])
+    daily_summary = backend_summary_dataframe(results)
+    daily_exceptions = backend_exceptions_dataframe(results)
 
     overview_tab, bp_tab, pp_tab, cb_tab, confirmo_tab, zen_tab, exception_tab, audit_tab, logic_tab = st.tabs(
         ["Overview", "BridgerPay", "PayProcc", "Coinsbuy", "Confirmo", "ZEN", "Exceptions", "File audit", "Logic reference"]
@@ -472,12 +549,17 @@ def render_backend_workspace() -> None:
 
     with overview_tab:
         overview_columns = [
-            "Orchestrator", "Backend Gateway", "Status", "Orchestrator Count", "Backend Created-Date Count",
+            "Reconciliation Date GMT+6", "Orchestrator", "Backend Gateway", "Status", "Orchestrator Count", "Backend Created-Date Count",
             "Matched", "Unmatched", "Orchestrator Only", "Backend Adjacent Report Needed",
             "Raw Amount Differences", "Amount Mismatch", "Amount Variance", "Tracking Mismatch", "Currency Mismatch",
         ]
-        st.dataframe(summary[[c for c in overview_columns if c in summary.columns]], use_container_width=True, hide_index=True)
-        review = summary[summary["Status"].isin(["REVIEW REQUIRED", "MATCHED WITH AMOUNT VARIANCES"])]
+        st.dataframe(
+            summary_display[[c for c in overview_columns if c in summary_display.columns]],
+            use_container_width=True, hide_index=True,
+        )
+        review = summary_display[
+            summary_display["Status"].isin(["REVIEW REQUIRED", "MATCHED WITH AMOUNT VARIANCES"])
+        ]
         st.subheader("Priority review")
         if review.empty:
             st.success("No backend-stage routes require review.")
@@ -534,17 +616,21 @@ def render_backend_workspace() -> None:
     with zen_tab:
         render_backend_route("ZEN")
     with exception_tab:
-        if exceptions.empty:
-            st.success("No backend-stage exceptions found.")
+        if daily_exceptions.empty:
+            st.success(f"No backend-stage exceptions found for {detail_date:%d %b %Y}.")
         else:
-            options = ["All"] + sorted(exceptions["Orchestrator"].dropna().unique().tolist())
+            options = ["All"] + sorted(daily_exceptions["Orchestrator"].dropna().unique().tolist())
             selected_orchestrator = st.selectbox("Filter orchestrator", options, key="backend_exception_filter")
-            filtered = exceptions if selected_orchestrator == "All" else exceptions[exceptions["Orchestrator"] == selected_orchestrator]
+            filtered = (
+                daily_exceptions
+                if selected_orchestrator == "All"
+                else daily_exceptions[daily_exceptions["Orchestrator"] == selected_orchestrator]
+            )
             st.dataframe(filtered, use_container_width=True, hide_index=True, height=560)
     with audit_tab:
         st.subheader("Upload mapping")
         st.dataframe(pd.DataFrame(mapping), use_container_width=True, hide_index=True)
-        st.subheader("File readiness")
+        st.subheader(f"File readiness — {detail_date:%d %b %Y}")
         st.dataframe(pd.DataFrame(audit), use_container_width=True, hide_index=True)
     with logic_tab:
         logic_rows = [{

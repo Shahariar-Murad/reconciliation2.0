@@ -1,4 +1,4 @@
-# Reconciliation Logic Reference — v2.5
+# Reconciliation Logic Reference — v2.6
 
 All selected dates are evaluated in **GMT+6 (Asia/Dhaka)**.
 
@@ -58,3 +58,8 @@ Exclude a Coinsbuy deposit when both conditions are true:
 - **MATCHED WITH AMOUNT VARIANCES:** all required references match, with only an allowed amount-variance classification.
 - **REVIEW REQUIRED:** true one-sided records, adjacent-report checks, amount mismatches, tracking/reference mismatches, currency mismatches, or duplicate keys exist.
 - **NO APPROVED DATA:** neither side contains approved records for the selected route/date.
+
+
+## Date-range execution
+
+For the backend stage, each selected GMT+6 calendar date is reconciled independently. The range does not aggregate rows before matching. The overview then combines the daily summaries and includes the reconciliation date as a separate column. Changing the date range invalidates and hides earlier results until the user runs the reconciliation again.
